@@ -1,0 +1,43 @@
+/// Mirrors web `FlockForm.tsx` MORTALITY_REASONS for parity.
+const Map<String, List<String>> mortalityReasons = {
+  'Disease': [
+    'Newcastle disease',
+    'Avian influenza',
+    'Gumboro',
+    "Marek's disease",
+    'Salmonellosis',
+    'Fowl cholera',
+    'Colibacillosis',
+    'Coccidiosis',
+    'Worm infestation',
+  ],
+  'Environmental': [
+    'Heat stress',
+    'Cold stress',
+    'Poor ventilation',
+    'High ammonia',
+    'Overcrowding',
+  ],
+  'Nutrition': [
+    'Malnutrition',
+    'Vitamin deficiency',
+    'Moldy feed',
+    'Poor-quality feed',
+  ],
+  'Water Issues': ['Dirty water', 'Dehydration', 'Water system failure'],
+  'Parasites': ['Mites', 'Lice', 'Ticks', 'Worms'],
+  'Management Error': [
+    'Poor vaccination',
+    'Mixing age groups',
+    'Rough handling',
+    'Poor biosecurity',
+  ],
+  'Toxicity': ['Aflatoxin', 'Chemical poisoning', 'Drug overdose'],
+  'Predators': ['Dog attack', 'Snake attack', 'Bird attack'],
+  'Stress': ['Transport stress', 'Noise stress', 'Environmental change'],
+  'Brooding': ['Wrong temperature', 'Weak chicks', 'Poor brooding care'],
+  'Genetic': ['Weak breed', 'Birth defect'],
+  'Injury/Accident': ['Cannibalism', 'Trampling', 'Equipment injury'],
+  'Unknown': ['Unknown cause yet'],
+  'Other': ['Other'],
+};

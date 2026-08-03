@@ -1,0 +1,10 @@
+{
+    "cmake.sourceDirectory": "C:/Users/Latitude 9520/Desktop/PMF_dex/pfm-desktop/windows/flutter",
+    "chat.tools.terminal.autoApprove": {
+        "/^flutter analyze lib/views/auth/activation_view\\.dart lib/services/api_config\\.dart lib/data/sync_engine\\.dart$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "flutter": true
+    }
+}
