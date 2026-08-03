@@ -2,13 +2,9 @@ import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:drift/drift.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:flutter_dotenv/flutter_dotenv.dart';
-import 'package:http/http.dart' as http;
 import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/foundation.dart';
-import 'package:device_info_plus/device_info_plus.dart';
-import 'dart:io' show Platform;
 import '../utils/farm_utils.dart';
 import '../utils/id_utils.dart';
 import '../utils/user_role.dart';
@@ -123,29 +119,27 @@ class SyncEngine extends ChangeNotifier {
     });
   }
 
-  Future<void> syncNow() => _syncWhenSupabaseReachable();
+  Future<void> syncNow() => _syncWhenNestReachable();
 
-  Future<bool> _canReachSupabase() async {
-    final url = dotenv.env['SUPABASE_URL'];
-    final uri = Uri.tryParse(url ?? '');
-    if (uri == null ||
-        uri.host.isEmpty ||
-        uri.host == 'PLACEHOLDER.supabase.co') {
-      return true;
-    }
-
-    try {
-      final response = await http.head(uri).timeout(const Duration(seconds: 3));
-      return response.statusCode < 500;
-    } catch (e) {
-      debugPrint('[Sync] Supabase reachability check failed: $e');
+  Future<bool> _canReachNest() async {
+    if (!_hatchlogApi.isConfigured) {
+      debugPrint('[Sync] HATCHLOG_API_URL missing — farm sync blocked');
       return false;
+    }
+    return _hatchlogApi.canReach();
+  }
+
+  void _requireNestApi() {
+    if (!_hatchlogApi.isConfigured) {
+      throw StateError(
+        'HATCHLOG_API_URL is required for Nest-owned farm/commerce sync',
+      );
     }
   }
 
-  Future<void> _syncWhenSupabaseReachable() async {
+  Future<void> _syncWhenNestReachable() async {
     if (!_isOnline) return;
-    if (await _canReachSupabase()) {
+    if (await _canReachNest()) {
       _reachabilityTimer?.cancel();
       _reachabilityTimer = null;
       unawaited(performSync());
@@ -156,7 +150,7 @@ class SyncEngine extends ChangeNotifier {
       _,
     ) async {
       if (!_isOnline) return;
-      if (!await _canReachSupabase()) return;
+      if (!await _canReachNest()) return;
       _reachabilityTimer?.cancel();
       _reachabilityTimer = null;
       unawaited(performSync());
@@ -178,7 +172,7 @@ class SyncEngine extends ChangeNotifier {
       _isOnline = online;
       notifyListeners();
       if (_isOnline) {
-        unawaited(_syncWhenSupabaseReachable());
+        unawaited(_syncWhenNestReachable());
       } else {
         _reachabilityTimer?.cancel();
         _reachabilityTimer = null;
@@ -188,7 +182,11 @@ class SyncEngine extends ChangeNotifier {
 
   Future<void> performSync() async {
     if (_isSyncing || !_isOnline) return;
-    if (!await _canReachSupabase()) return;
+    if (!_hatchlogApi.isConfigured) {
+      debugPrint('[Sync] Aborted: HATCHLOG_API_URL is required');
+      return;
+    }
+    if (!await _canReachNest()) return;
 
     // Stamp last_used so anti-clock-tamper guard has a fresh timestamp.
     await LicenseService(db).touchLastUsed();
@@ -214,11 +212,10 @@ class SyncEngine extends ChangeNotifier {
           ? safeIdString(webFarmId)
           : safeIdString(farmId);
       await _syncFarmMembersFromCloud(farmIdFilter);
-      final userIdMap = CloudUserIdMapService(db);
-      await userIdMap.warmCacheForFarm(farmIdFilter);
+      await CloudUserIdMapService(db).warmCacheForFarm(farmIdFilter);
 
-      await _pushChanges(webFarmId: webFarmId, userIdMap: userIdMap);
-      await _pushDeletions();
+      await _pushChanges(webFarmId: webFarmId);
+      await _pushDeletions(webFarmId: webFarmId);
       await _pullChanges();
     } finally {
       _isSyncing = false;
@@ -227,293 +224,14 @@ class SyncEngine extends ChangeNotifier {
     }
   }
 
+  /// Deprecated: Supabase farm bootstrap path. Use [performSync] / [_pullChanges]
+  /// (Nest domain REST). Team permissions RPC remains in [_pullChanges].
+  @Deprecated('Use performSync(); Nest owns farm domain data.')
   Future<void> initialFullSync(String farmId) async {
-    if (!_isOnline) throw Exception("No internet connection for initial sync");
-
-    _isSyncing = true;
-    _updateSyncStatus(true);
-    notifyListeners();
-
-    try {
-      final farmIdFilter = safeIdString(farmId);
-      final data = await _supabase.rpc(
-        'get_farm_sync_data',
-        params: {'p_farm_id': farmIdFilter},
-      );
-
-      if (data == null) {
-        throw Exception(
-          "Farm not found or Permission Denied. Binding refused.",
-        );
-      }
-
-      // 0. Hardware Binding
-      try {
-        final deviceInfo = DeviceInfoPlugin();
-        String deviceId = "unknown_device";
-        String deviceName = "Unknown Desktop";
-
-        if (Platform.isWindows) {
-          final windowsInfo = await deviceInfo.windowsInfo;
-          deviceId = windowsInfo.deviceId;
-          deviceName = windowsInfo.computerName;
-        }
-
-        await _supabase.rpc(
-          'register_hardware_device',
-          params: {
-            'p_farm_id': farmIdFilter,
-            'p_device_id': deviceId,
-            'p_device_name': deviceName,
-          },
-        );
-      } catch (e) {
-        debugPrint("Hardware registration warning: $e");
-      }
-
-      // 1. Farm
-      final remoteFarm = data['farm'] as Map<String, dynamic>;
-      await db
-          .into(db.farms)
-          .insertOnConflictUpdate(
-            FarmsCompanion.insert(
-              id: safeIdString(remoteFarm['id']),
-              name: remoteFarm['name'] as String,
-              capacity: remoteFarm['capacity'] as int,
-              userId: remoteFarm['userId'] as String? ?? '',
-              location: Value(remoteFarm['location'] as String?),
-              subscriptionTier: Value(
-                remoteFarm['subscriptionTier'] as String? ?? 'FREE',
-              ),
-            ),
-          );
-
-      // 2. Farm Settings
-      final remoteSettings = data['farm_settings'] as Map<String, dynamic>?;
-      if (remoteSettings != null) {
-        await db
-            .into(db.farmSettings)
-            .insertOnConflictUpdate(
-              FarmSettingsCompanion.insert(
-                id: safeIdString(remoteSettings['id']),
-                farmId: safeIdString(remoteSettings['farmId']),
-                currency: Value(remoteSettings['currency'] as String? ?? 'GHS'),
-                eggRecordReminderTime: Value(
-                  remoteSettings['eggRecordReminderTime'] as String?,
-                ),
-                feedRecordReminderTime: Value(
-                  remoteSettings['feedRecordReminderTime'] as String?,
-                ),
-                growthTargetStandard: Value(
-                  remoteSettings['growth_target_standard'] as int?,
-                ),
-                eggsPerCrate: Value(
-                  remoteSettings['eggsPerCrate'] as int? ?? 30,
-                ),
-              ),
-            );
-      }
-
-      // 3. Users and farm memberships are downstream-only on desktop.
-      final remoteUsers = (data['users'] as List<dynamic>?) ?? [];
-      await _syncFarmMembersFromCloud(farmIdFilter, rpcUsers: remoteUsers);
-
-      // 4. Houses
-      final remoteHouses = (data['houses'] as List<dynamic>?) ?? [];
-      for (var h in remoteHouses) {
-        final house = h as Map<String, dynamic>;
-        await db
-            .into(db.houses)
-            .insertOnConflictUpdate(
-              HousesCompanion.insert(
-                id: safeIdString(house['id']),
-                farmId: farmIdFilter,
-                userId: Value(
-                  house['user_id'] as String? ?? house['userId'] as String?,
-                ),
-                name: house['name'] as String,
-                capacity: _safeInt(house['capacity']) ?? 0,
-                currentTemperature: Value(
-                  _safeDouble(
-                    house['current_temperature'] ?? house['currentTemperature'],
-                  ),
-                ),
-                currentHumidity: Value(
-                  _safeDouble(
-                    house['current_humidity'] ?? house['currentHumidity'],
-                  ),
-                ),
-                isIsolation: Value(
-                  _safeBool(
-                    house['is_isolation'] ?? house['isIsolation'],
-                    fallback: false,
-                  ),
-                ),
-                synced: const Value(true),
-              ),
-            );
-      }
-
-      // 5. Inventory
-      final remoteInventory = (data['inventory'] as List<dynamic>?) ?? [];
-      for (var i in remoteInventory) {
-        final item = i as Map<String, dynamic>;
-        await db
-            .into(db.inventory)
-            .insertOnConflictUpdate(
-              InventoryCompanion.insert(
-                id: safeIdString(item['id']),
-                farmId: farmIdFilter,
-                userId: Value(
-                  item['user_id'] as String? ?? item['userId'] as String?,
-                ),
-                itemName: (item['item_name'] ?? item['itemName']) as String,
-                stockLevel:
-                    _safeDouble(item['stock_level'] ?? item['stockLevel']) ??
-                    0.0,
-                reorderLevel: Value(
-                  _safeDouble(item['reorder_level'] ?? item['reorderLevel']),
-                ),
-                unit: item['unit'] as String,
-                category: Value(item['category'] as String?),
-                costPerUnit: Value(
-                  _safeDouble(item['cost_per_unit'] ?? item['costPerUnit']),
-                ),
-                eggCategoryId: Value(
-                  _safeStr(item['egg_category_id'] ?? item['eggCategoryId']),
-                ),
-                supplierId: Value(
-                  _safeStr(item['supplier_id'] ?? item['supplierId']),
-                ),
-                synced: const Value(true),
-              ),
-            );
-      }
-
-      // 6. Batches
-      final remoteBatches = (data['batches'] as List<dynamic>?) ?? [];
-      for (var b in remoteBatches) {
-        final batch = b as Map<String, dynamic>;
-        await db
-            .into(db.batches)
-            .insertOnConflictUpdate(
-              BatchesCompanion.insert(
-                id: safeIdString(batch['id']),
-                farmId: farmIdFilter,
-                houseId: Value(_safeStr(batch['house_id'] ?? batch['houseId'])),
-                userId: Value(
-                  batch['user_id'] as String? ?? batch['userId'] as String?,
-                ),
-                batchName: Value(
-                  batch['batch_name'] as String? ??
-                      batch['batchName'] as String? ??
-                      '',
-                ),
-                type: Value(batch['type'] as String? ?? ''),
-                breedType: Value(
-                  batch['breed_type'] as String? ??
-                      batch['breedType'] as String?,
-                ),
-                status: Value(batch['status'] as String? ?? ''),
-                arrivalDate:
-                    _safeDateTime(
-                      batch['arrival_date'] ?? batch['arrivalDate'],
-                    ) ??
-                    DateTime.now().toUtc(),
-                currentCount:
-                    _safeInt(batch['current_count'] ?? batch['currentCount']) ??
-                    0,
-                initialCount:
-                    _safeInt(batch['initial_count'] ?? batch['initialCount']) ??
-                    0,
-                isolationCount: Value(
-                  _safeInt(
-                        batch['isolation_count'] ?? batch['isolationCount'],
-                      ) ??
-                      0,
-                ),
-                initialActualCost: Value(
-                  _safeDouble(batch['initial_actual_cost']),
-                ),
-                growthTarget: Value(batch['growth_target'] as String?),
-                synced: const Value(true),
-              ),
-            );
-      }
-
-      // 7. Customers
-      final remoteCustomers = (data['customers'] as List<dynamic>?) ?? [];
-      for (var c in remoteCustomers) {
-        final customer = c as Map<String, dynamic>;
-        await db
-            .into(db.customers)
-            .insertOnConflictUpdate(
-              CustomersCompanion.insert(
-                id: safeIdString(customer['id']),
-                farmId: farmIdFilter,
-                name: customer['name'] as String,
-                phone: Value(customer['phone'] as String?),
-                email: Value(customer['email'] as String?),
-                address: Value(customer['address'] as String?),
-                balanceOwed: Value(_safeDouble(customer['balanceOwed']) ?? 0.0),
-                customerType: const Value('CUSTOMER'),
-                supplyItems: Value(customer['supplyItems'] as String?),
-                contactPerson: Value(customer['contactPerson'] as String?),
-                synced: const Value(true),
-              ),
-            );
-      }
-
-      await _syncSuppliersFromCloud(farmIdFilter);
-
-      // 8. Expenses
-      final remoteExpenses = await _supabase
-          .from('expenses')
-          .select()
-          .eq('farmId', farmIdFilter);
-      for (var e in remoteExpenses) {
-        final description = _safeStr(e['description']);
-        await db
-            .into(db.expenses)
-            .insertOnConflictUpdate(
-              ExpensesCompanion.insert(
-                id: safeIdString(e['id']),
-                farmId: farmIdFilter,
-                batchId: Value(_safeStr(e['batch_id'] ?? e['batchId'])),
-                supplierId: Value(
-                  _safeStr(e['supplierId'] ?? e['supplier_id']),
-                ),
-                category: e['category'] as String,
-                amount: _safeDouble(e['amount']) ?? 0.0,
-                date: Value(
-                  _safeDateTime(e['expense_date'] ?? e['date']) ??
-                      DateTime.now().toUtc(),
-                ),
-                description: Value(description),
-                allocationGroupId: Value(
-                  _allocationGroupFromDescription(description),
-                ),
-                allocationPercent: Value(
-                  _allocationPercentFromDescription(description),
-                ),
-                isSharedAllocation: Value(
-                  _isSharedAllocationDescription(description),
-                ),
-                userId: Value(_safeStr(e['user_id'] ?? e['userId'])),
-                synced: const Value(true),
-              ),
-            );
-      }
-
-      await _pullHealthSchedules(farmIdFilter);
-    } catch (e) {
-      debugPrint("Initial Sync Error: $e");
-      rethrow;
-    } finally {
-      _isSyncing = false;
-      _updateSyncStatus(false);
-      notifyListeners();
-    }
+    throw UnsupportedError(
+      'initialFullSync is deprecated and no longer boots farm tables from '
+      'Supabase. Use performSync() for Nest pull + team permissions RPC.',
+    );
   }
 
   Future<String?> _resolveWebFarmId() async {
@@ -550,57 +268,34 @@ class SyncEngine extends ChangeNotifier {
     return null;
   }
 
-  Future<void> _pushChanges({
-    String? webFarmId,
-    CloudUserIdMapService? userIdMap,
-  }) async {
+  Future<void> _pushChanges({String? webFarmId}) async {
     debugPrint('--- SYNC PUSH START (webFarmId=$webFarmId) ---');
 
     try {
-      final pushUserId = await FarmUtils.getUserId();
-      final map = userIdMap ?? CloudUserIdMapService(db);
-      final farmIdForMap = _remoteFarmIdForPush(
-        await FarmUtils.getBoundFarmId() ?? '',
-        webFarmId,
-      );
-      if (userIdMap == null) {
-        await map.warmCacheForFarm(farmIdForMap);
-      }
-      String? pushUserIdForPayload(String? localUserId) {
-        return map.resolveForPush(localUserId, sessionUserId: pushUserId);
-      }
-
-      // 1. Push Houses (camelCase columns)
+      // 1. Push Houses (Nest required)
       final pendingHouses = await (db.select(
         db.houses,
       )..where((t) => t.synced.equals(false))).get();
       for (var h in pendingHouses) {
         try {
           final id = safeIdString(h.id);
-          final existing = await _supabase
-              .from('houses')
-              .select('id')
-              .eq('id', id)
-              .maybeSingle();
-          final now = DateTime.now().toUtc().toIso8601String();
-          final payload = {
-            'id': id,
-            'farmId': _remoteFarmIdForPush(h.farmId, webFarmId),
-            'userId': pushUserIdForPayload(h.userId ?? pushUserId),
-            'name': h.name,
-            'capacity': h.capacity,
-            'currentTemperature': h.currentTemperature,
-            'currentHumidity': h.currentHumidity,
-            'isIsolation': h.isIsolation,
-            'updatedAt': now,
-          };
-
-          assertSyncPayloadUsesStringIds(payload);
-          if (existing != null) {
-            await _supabase.from('houses').update(payload).eq('id', id);
-          } else {
-            payload['createdAt'] = now;
-            await _supabase.from('houses').insert(payload);
+          final remoteFarmId = _remoteFarmIdForPush(h.farmId, webFarmId);
+          _requireNestApi();
+          try {
+            await _hatchlogApi.createHouse({
+              'id': id,
+              'farm_id': remoteFarmId,
+              'name': h.name,
+              'capacity': h.capacity,
+              'isIsolation': h.isIsolation,
+            });
+          } catch (_) {
+            await _hatchlogApi.updateHouse(id, {
+              'farm_id': remoteFarmId,
+              'name': h.name,
+              'capacity': h.capacity,
+              'isIsolation': h.isIsolation,
+            });
           }
           await (db.update(db.houses)..where((t) => t.id.equals(h.id))).write(
             const HousesCompanion(synced: Value(true)),
@@ -610,43 +305,36 @@ class SyncEngine extends ChangeNotifier {
         }
       }
 
-      // 2. Push Batches (Mixed camel/snake columns)
+      // 2. Push Batches (Nest required)
       final pendingBatches = await (db.select(
         db.batches,
       )..where((t) => t.synced.equals(false))).get();
       for (var b in pendingBatches) {
         try {
           final id = safeIdString(b.id);
-          final existing = await _supabase
-              .from('batches')
-              .select('id')
-              .eq('id', id)
-              .maybeSingle();
-          final now = DateTime.now().toUtc().toIso8601String();
-          final payload = {
-            'id': id,
-            'farmId': _remoteFarmIdForPush(b.farmId, webFarmId),
-            'houseId': optionalIdString(b.houseId),
-            'userId': pushUserIdForPayload(b.userId ?? pushUserId),
-            'batchName': b.batchName,
-            'type': b.type,
-            'breedType': b.breedType,
-            'status': b.status,
-            'arrivalDate': b.arrivalDate.toIso8601String(),
-            'currentCount': b.currentCount,
-            'initialCount': b.initialCount,
-            'isolationCount': b.isolationCount,
-            'initial_actual_cost': b.initialActualCost,
-            'growth_target': b.growthTarget,
-            'updatedAt': now,
-          };
-          assertSyncPayloadUsesStringIds(payload);
-
-          if (existing != null) {
-            await _supabase.from('batches').update(payload).eq('id', id);
-          } else {
-            payload['createdAt'] = now;
-            await _supabase.from('batches').insert(payload);
+          final remoteFarmId = _remoteFarmIdForPush(b.farmId, webFarmId);
+          _requireNestApi();
+          try {
+            await _hatchlogApi.createLivestock({
+              'id': id,
+              'farm_id': remoteFarmId,
+              'houseId': optionalIdString(b.houseId) ?? '',
+              'breedType': b.breedType ?? 'UNKNOWN',
+              'type': b.type,
+              'batchName': b.batchName,
+              'initialCount': b.initialCount,
+              'arrivalDate': b.arrivalDate.toIso8601String(),
+            });
+          } catch (_) {
+            await _hatchlogApi.updateLivestock(id, {
+              'houseId': optionalIdString(b.houseId),
+              'breedType': b.breedType,
+              'batchName': b.batchName,
+              'initialCount': b.initialCount,
+              'currentCount': b.currentCount,
+              'arrivalDate': b.arrivalDate.toIso8601String(),
+              'status': b.status,
+            });
           }
           await (db.update(db.batches)..where((t) => t.id.equals(b.id))).write(
             const BatchesCompanion(synced: Value(true)),
@@ -656,39 +344,36 @@ class SyncEngine extends ChangeNotifier {
         }
       }
 
-      // 3. Push Inventory (camelCase columns)
+      // 3. Push Inventory (Nest required)
       final pendingInventory = await (db.select(
         db.inventory,
       )..where((t) => t.synced.equals(false))).get();
       for (var i in pendingInventory) {
         try {
           final id = safeIdString(i.id);
-          final existing = await _supabase
-              .from('inventory')
-              .select('id')
-              .eq('id', id)
-              .maybeSingle();
-          final now = DateTime.now().toUtc().toIso8601String();
-          final payload = {
-            'id': id,
-            'farmId': _remoteFarmIdForPush(i.farmId, webFarmId),
-            'userId': pushUserIdForPayload(i.userId),
-            'itemName': i.itemName,
-            'stockLevel': i.stockLevel,
-            'reorderLevel': i.reorderLevel,
-            'unit': i.unit,
-            'category': i.category,
-            'costPerUnit': i.costPerUnit,
-            'supplierId': optionalIdString(i.supplierId),
-            'updatedAt': now,
-          };
-          assertSyncPayloadUsesStringIds(payload);
-
-          if (existing != null) {
-            await _supabase.from('inventory').update(payload).eq('id', id);
-          } else {
-            payload['createdAt'] = now;
-            await _supabase.from('inventory').insert(payload);
+          final remoteFarmId = _remoteFarmIdForPush(i.farmId, webFarmId);
+          _requireNestApi();
+          try {
+            await _hatchlogApi.createInventory({
+              'farm_id': remoteFarmId,
+              'itemName': i.itemName,
+              'stockLevel': i.stockLevel,
+              'unit': i.unit,
+              'category': i.category,
+              'costPerUnit': i.costPerUnit,
+              'supplierId': optionalIdString(i.supplierId),
+            });
+          } catch (_) {
+            await _hatchlogApi.updateInventory(id, {
+              'farm_id': remoteFarmId,
+              'itemName': i.itemName,
+              'stockLevel': i.stockLevel,
+              'unit': i.unit,
+              'category': i.category,
+              'costPerUnit': i.costPerUnit,
+              'supplierId': optionalIdString(i.supplierId),
+              'reorderLevel': i.reorderLevel,
+            });
           }
           await (db.update(db.inventory)..where((t) => t.id.equals(i.id)))
               .write(const InventoryCompanion(synced: Value(true)));
@@ -697,7 +382,7 @@ class SyncEngine extends ChangeNotifier {
         }
       }
 
-      // 4. Push Mortality (Nest when configured, else Supabase)
+      // 4. Push Mortality (Nest pushMutation required)
       final pendingMortality = await (db.select(
         db.mortalities,
       )..where((t) => t.synced.equals(false))).get();
@@ -705,54 +390,24 @@ class SyncEngine extends ChangeNotifier {
         try {
           final id = safeIdString(m.id);
           final remoteFarmId = _remoteFarmIdForPush(m.farmId, webFarmId);
-          if (_hatchlogApi.isConfigured) {
-            final ok = await _hatchlogApi.pushMutation(
-              farmId: remoteFarmId,
-              clientId: id,
-              entityType: 'mortality',
-              payload: {
-                'batch_id': safeIdString(m.batchId),
-                'farm_id': remoteFarmId,
-                'count': m.count,
-                'health_type': m.healthType,
-                'reason': m.reason,
-                'category': m.category,
-                'sub_category': m.subCategory,
-                'isolation_room_id': optionalIdString(m.isolationRoomId),
-                'log_date': m.logDate.toIso8601String(),
-              },
-            );
-            if (!ok) throw StateError('Nest mortality push rejected');
-          } else {
-            final existing = await _supabase
-                .from('mortality')
-                .select('id')
-                .eq('id', id)
-                .maybeSingle();
-            final now = DateTime.now().toUtc().toIso8601String();
-            final payload = {
-              'id': id,
-              'farmId': remoteFarmId,
-              'batchId': safeIdString(m.batchId),
+          _requireNestApi();
+          final ok = await _hatchlogApi.pushMutation(
+            farmId: remoteFarmId,
+            clientId: id,
+            entityType: 'mortality',
+            payload: {
+              'batch_id': safeIdString(m.batchId),
+              'farm_id': remoteFarmId,
               'count': m.count,
-              'type': m.healthType,
+              'health_type': m.healthType,
               'reason': m.reason,
-              'logDate': m.logDate.toIso8601String(),
-              'user_id': pushUserIdForPayload(m.userId),
               'category': m.category,
               'sub_category': m.subCategory,
               'isolation_room_id': optionalIdString(m.isolationRoomId),
-              'updatedAt': now,
-            };
-            assertSyncPayloadUsesStringIds(payload);
-
-            if (existing != null) {
-              await _supabase.from('mortality').update(payload).eq('id', id);
-            } else {
-              payload['createdAt'] = now;
-              await _supabase.from('mortality').insert(payload);
-            }
-          }
+              'log_date': m.logDate.toIso8601String(),
+            },
+          );
+          if (!ok) throw StateError('Nest mortality push rejected');
           await (db.update(db.mortalities)..where((t) => t.id.equals(m.id)))
               .write(const MortalitiesCompanion(synced: Value(true)));
         } catch (e) {
@@ -760,7 +415,7 @@ class SyncEngine extends ChangeNotifier {
         }
       }
 
-      // 5. Push Feeding Logs (Nest when configured, else Supabase)
+      // 5. Push Feeding Logs (Nest pushMutation required)
       final pendingFeeding = await (db.select(
         db.feedingLogs,
       )..where((t) => t.synced.equals(false))).get();
@@ -768,48 +423,21 @@ class SyncEngine extends ChangeNotifier {
         try {
           final id = safeIdString(fl.id);
           final remoteFarmId = _remoteFarmIdForPush(fl.farmId, webFarmId);
-          if (_hatchlogApi.isConfigured) {
-            final ok = await _hatchlogApi.pushMutation(
-              farmId: remoteFarmId,
-              clientId: id,
-              entityType: 'feed_usage',
-              payload: {
-                'batch_id': optionalIdString(fl.batchId),
-                'feed_type_id': optionalIdString(fl.feedTypeId),
-                'formulation_id': optionalIdString(fl.formulationId),
-                'amount_consumed': fl.amountConsumed,
-                'log_date': fl.logDate.toIso8601String(),
-                'farm_id': remoteFarmId,
-              },
-            );
-            if (!ok) throw StateError('Nest feed push rejected');
-          } else {
-            final existing = await _supabase
-                .from('daily_feeding_logs')
-                .select('id')
-                .eq('id', id)
-                .maybeSingle();
-            final payload = {
-              'id': id,
-              'farmId': remoteFarmId,
+          _requireNestApi();
+          final ok = await _hatchlogApi.pushMutation(
+            farmId: remoteFarmId,
+            clientId: id,
+            entityType: 'feed_usage',
+            payload: {
               'batch_id': optionalIdString(fl.batchId),
               'feed_type_id': optionalIdString(fl.feedTypeId),
               'formulation_id': optionalIdString(fl.formulationId),
               'amount_consumed': fl.amountConsumed,
               'log_date': fl.logDate.toIso8601String(),
-              'user_id': pushUserIdForPayload(fl.userId),
-            };
-            assertSyncPayloadUsesStringIds(payload);
-
-            if (existing != null) {
-              await _supabase
-                  .from('daily_feeding_logs')
-                  .update(payload)
-                  .eq('id', id);
-            } else {
-              await _supabase.from('daily_feeding_logs').insert(payload);
-            }
-          }
+              'farm_id': remoteFarmId,
+            },
+          );
+          if (!ok) throw StateError('Nest feed push rejected');
           await (db.update(db.feedingLogs)..where((t) => t.id.equals(fl.id)))
               .write(const FeedingLogsCompanion(synced: Value(true)));
         } catch (e) {
@@ -817,7 +445,7 @@ class SyncEngine extends ChangeNotifier {
         }
       }
 
-      // 6. Push Egg Production (Nest when configured, else Supabase)
+      // 6. Push Egg Production (Nest pushMutation required)
       final pendingEggs = await (db.select(
         db.eggProductions,
       )..where((t) => t.synced.equals(false))).get();
@@ -825,64 +453,28 @@ class SyncEngine extends ChangeNotifier {
         try {
           final id = safeIdString(ep.id);
           final remoteFarmId = _remoteFarmIdForPush(ep.farmId, webFarmId);
-          if (_hatchlogApi.isConfigured) {
-            final ok = await _hatchlogApi.pushMutation(
-              farmId: remoteFarmId,
-              clientId: id,
-              entityType: 'egg_collection',
-              payload: {
-                'batch_id': safeIdString(ep.batchId),
-                'farm_id': remoteFarmId,
-                'category_id': optionalIdString(ep.categoryId),
-                'eggs_collected': ep.eggsCollected,
-                'unusable_count': ep.unusableCount,
-                'eggs_remaining': ep.eggsRemaining,
-                'crates': ep.cratesCollected,
-                'quality_grade': ep.qualityGrade,
-                'is_sorted': ep.isSorted,
-                'small_count': ep.smallCount,
-                'medium_count': ep.mediumCount,
-                'large_count': ep.largeCount,
-                'log_date': ep.logDate.toIso8601String(),
-              },
-            );
-            if (!ok) throw StateError('Nest egg push rejected');
-          } else {
-            final existing = await _supabase
-                .from('egg_production')
-                .select('id')
-                .eq('id', id)
-                .maybeSingle();
-            final now = DateTime.now().toUtc().toIso8601String();
-            final payload = {
-              'id': id,
-              'farmId': remoteFarmId,
-              'batchId': safeIdString(ep.batchId),
-              'categoryId': optionalIdString(ep.categoryId),
-              'eggsCollected': ep.eggsCollected,
-              'unusableCount': ep.unusableCount,
-              'eggsRemaining': ep.eggsRemaining,
-              'cratesCollected': ep.cratesCollected,
-              'qualityGrade': ep.qualityGrade,
-              'isSorted': ep.isSorted,
-              'smallCount': ep.smallCount,
-              'mediumCount': ep.mediumCount,
-              'largeCount': ep.largeCount,
-              'logDate': ep.logDate.toIso8601String(),
-              'userId': pushUserIdForPayload(ep.userId),
-            };
-            assertSyncPayloadUsesStringIds(payload);
-
-            if (existing != null) {
-              await _supabase
-                  .from('egg_production')
-                  .update(payload)
-                  .eq('id', id);
-            } else {
-              payload['createdAt'] = now;
-              await _supabase.from('egg_production').insert(payload);
-            }
-          }
+          _requireNestApi();
+          final ok = await _hatchlogApi.pushMutation(
+            farmId: remoteFarmId,
+            clientId: id,
+            entityType: 'egg_collection',
+            payload: {
+              'batch_id': safeIdString(ep.batchId),
+              'farm_id': remoteFarmId,
+              'category_id': optionalIdString(ep.categoryId),
+              'eggs_collected': ep.eggsCollected,
+              'unusable_count': ep.unusableCount,
+              'eggs_remaining': ep.eggsRemaining,
+              'crates': ep.cratesCollected,
+              'quality_grade': ep.qualityGrade,
+              'is_sorted': ep.isSorted,
+              'small_count': ep.smallCount,
+              'medium_count': ep.mediumCount,
+              'large_count': ep.largeCount,
+              'log_date': ep.logDate.toIso8601String(),
+            },
+          );
+          if (!ok) throw StateError('Nest egg push rejected');
           await (db.update(db.eggProductions)..where((t) => t.id.equals(ep.id)))
               .write(const EggProductionsCompanion(synced: Value(true)));
         } catch (e) {
@@ -890,36 +482,50 @@ class SyncEngine extends ChangeNotifier {
         }
       }
 
-      // 7. Push Sales (camelCase columns)
+      // 7. Push Sales (Nest required)
       final pendingSales = await (db.select(
         db.sales,
       )..where((t) => t.synced.equals(false))).get();
       for (var s in pendingSales) {
         try {
-          final id = safeIdString(s.id);
-          final existing = await _supabase
-              .from('sales')
-              .select('id')
-              .eq('id', id)
-              .maybeSingle();
-          final now = DateTime.now().toUtc().toIso8601String();
-          final payload = {
-            'id': id,
-            'farmId': _remoteFarmIdForPush(s.farmId, webFarmId),
-            'customerId': optionalIdString(s.customerId),
-            'userId': pushUserIdForPayload(s.userId),
+          final remoteFarmId = _remoteFarmIdForPush(s.farmId, webFarmId);
+          _requireNestApi();
+          final saleItemRows = await db.customSelect(
+            'SELECT * FROM sale_items WHERE sale_id = ?',
+            variables: [Variable.withString(s.id)],
+            readsFrom: {},
+          ).get();
+          final items = saleItemRows.isEmpty
+              ? [
+                  {
+                    'description': 'Sale',
+                    'quantity': 1,
+                    'unitPrice': s.totalAmount,
+                    'totalPrice': s.totalAmount,
+                  },
+                ]
+              : saleItemRows.map((row) {
+                  final qty = row.read<int>('quantity');
+                  return {
+                    'description':
+                        row.read<String>('description').isEmpty
+                            ? 'Sale item'
+                            : row.read<String>('description'),
+                    'quantity': qty < 1 ? 1 : qty,
+                    'unitPrice': row.read<double>('unit_price'),
+                    'totalPrice': row.read<double>('total_price'),
+                  };
+                }).toList();
+          await _hatchlogApi.createSale({
+            'farm_id': remoteFarmId,
+            'customerName': 'Customer',
             'totalAmount': s.totalAmount,
-            'saleDate': s.saleDate.toIso8601String(),
-            'updatedAt': now,
-          };
-          assertSyncPayloadUsesStringIds(payload);
-
-          if (existing != null) {
-            await _supabase.from('sales').update(payload).eq('id', id);
-          } else {
-            payload['createdAt'] = now;
-            await _supabase.from('sales').insert(payload);
-          }
+            'items': items,
+          });
+          await db.customStatement(
+            'UPDATE sale_items SET synced = 1 WHERE sale_id = ?',
+            [s.id],
+          );
           await (db.update(db.sales)..where((t) => t.id.equals(s.id))).write(
             const SalesCompanion(synced: Value(true)),
           );
@@ -928,11 +534,7 @@ class SyncEngine extends ChangeNotifier {
         }
       }
 
-      await _pushSaleItems(webFarmId);
-      await _pushFinancialTransactions(
-        webFarmId,
-        pushUserIdForPayload: pushUserIdForPayload,
-      );
+      await _pushFinancialTransactions(webFarmId);
 
       // 8. Push Customers / Suppliers (web uses separate tables)
       final pendingCustomers = await (db.select(
@@ -952,39 +554,43 @@ class SyncEngine extends ChangeNotifier {
         }
       }
 
-      // 9. Push Feed Formulations
+      // 9. Push Feed Formulations (Nest required)
       final pendingFormulations = await (db.select(
         db.feedFormulations,
       )..where((t) => t.synced.equals(false))).get();
       for (var ff in pendingFormulations) {
         try {
           final id = safeIdString(ff.id);
-          final now = DateTime.now().toUtc().toIso8601String();
-          final payload = {
-            'id': id,
-            'farmId': _remoteFarmIdForPush(ff.farmId, webFarmId),
-            'name': ff.name,
-            'notes': ff.notes,
-            'type': ff.type,
-            'targetLivestock': ff.targetLivestock,
-            'stockLevel': ff.stockLevel,
-            'createdAt': ff.createdAt.toUtc().toIso8601String(),
-            'updatedAt': now,
-          };
-          assertSyncPayloadUsesStringIds(payload);
-          final existing = await _supabase
-              .from('feed_formulations')
-              .select('id')
-              .eq('id', id)
-              .maybeSingle();
-          if (existing != null) {
-            await _supabase
-                .from('feed_formulations')
-                .update(payload)
-                .eq('id', id);
-          } else {
-            await _supabase.from('feed_formulations').insert(payload);
+          final remoteFarmId = _remoteFarmIdForPush(ff.farmId, webFarmId);
+          _requireNestApi();
+          final ings = await (db.select(
+            db.feedFormulationIngredients,
+          )..where((t) => t.formulationId.equals(ff.id))).get();
+          final ingredients = ings
+              .map(
+                (ing) => {
+                  'inventoryId': safeIdString(ing.inventoryId),
+                  'quantity': ing.quantity,
+                },
+              )
+              .toList();
+          if (ingredients.isEmpty) {
+            throw StateError('Formulation $id has no ingredients for Nest');
           }
+          await _hatchlogApi.createFeedFormulation({
+            'farm_id': remoteFarmId,
+            'name': ff.name,
+            'type': ff.type.isEmpty ? 'CUSTOM' : ff.type,
+            if (ff.targetLivestock != null &&
+                ff.targetLivestock!.trim().isNotEmpty)
+              'targetLivestock': ff.targetLivestock,
+            'ingredients': ingredients,
+          });
+          await (db.update(db.feedFormulationIngredients)
+                ..where((t) => t.formulationId.equals(ff.id)))
+              .write(
+            const FeedFormulationIngredientsCompanion(synced: Value(true)),
+          );
           await (db.update(db.feedFormulations)
                 ..where((t) => t.id.equals(ff.id)))
               .write(const FeedFormulationsCompanion(synced: Value(true)));
@@ -993,77 +599,23 @@ class SyncEngine extends ChangeNotifier {
         }
       }
 
-      // 9.1 Push Feed Formulation Ingredients
-      final pendingIngredients = await (db.select(
-        db.feedFormulationIngredients,
-      )..where((t) => t.synced.equals(false))).get();
-      for (var ing in pendingIngredients) {
-        try {
-          final id = safeIdString(ing.id);
-          final payload = {
-            'id': id,
-            'formulationId': safeIdString(ing.formulationId),
-            'inventoryId': safeIdString(ing.inventoryId),
-            'quantity': ing.quantity,
-            'unit': ing.unit,
-          };
-          assertSyncPayloadUsesStringIds(payload);
-          final existing = await _supabase
-              .from('feed_formulation_ingredients')
-              .select('id')
-              .eq('id', id)
-              .maybeSingle();
-          if (existing != null) {
-            await _supabase
-                .from('feed_formulation_ingredients')
-                .update(payload)
-                .eq('id', id);
-          } else {
-            await _supabase.from('feed_formulation_ingredients').insert(payload);
-          }
-          await (db.update(db.feedFormulationIngredients)
-                ..where((t) => t.id.equals(ing.id)))
-              .write(
-            const FeedFormulationIngredientsCompanion(synced: Value(true)),
-          );
-        } catch (e) {
-          debugPrint("FeedFormulationIngredient push error: $e");
-        }
-      }
-
-      // 11. Push Expenses
+      // 11. Push Expenses (Nest required)
       final pendingExpenses = await (db.select(
         db.expenses,
       )..where((t) => t.synced.equals(false))).get();
       for (var e in pendingExpenses) {
         try {
-          final id = safeIdString(e.id);
-          final existing = await _supabase
-              .from('expenses')
-              .select('id')
-              .eq('id', id)
-              .maybeSingle();
-          final now = DateTime.now().toUtc().toIso8601String();
-          final payload = {
-            'id': id,
-            'farmId': _remoteFarmIdForPush(e.farmId, webFarmId),
-            'batch_id': optionalIdString(e.batchId),
-            'supplierId': optionalIdString(e.supplierId),
-            'user_id': pushUserIdForPayload(e.userId),
-            'category': _normalizeExpenseCategory(e.category),
+          final remoteFarmId = _remoteFarmIdForPush(e.farmId, webFarmId);
+          _requireNestApi();
+          await _hatchlogApi.createExpense({
+            'farm_id': remoteFarmId,
             'amount': e.amount,
-            'expense_date': e.date.toIso8601String(),
+            'category': _normalizeExpenseCategory(e.category),
             'description': e.description,
-            'updated_at': now,
-          };
-          assertSyncPayloadUsesStringIds(payload);
-
-          if (existing != null) {
-            await _supabase.from('expenses').update(payload).eq('id', id);
-          } else {
-            payload['created_at'] = now;
-            await _supabase.from('expenses').insert(payload);
-          }
+            'expenseDate': e.date.toIso8601String(),
+            if (optionalIdString(e.batchId) != null)
+              'batch_id': optionalIdString(e.batchId),
+          });
           await (db.update(db.expenses)..where((t) => t.id.equals(e.id))).write(
             const ExpensesCompanion(synced: Value(true)),
           );
@@ -1078,11 +630,7 @@ class SyncEngine extends ChangeNotifier {
       )..where((t) => t.synced.equals(false))).get();
       for (var s in pendingSettlements) {
         try {
-          await _pushSettlementToCloud(
-            s,
-            webFarmId,
-            pushUserIdForPayload: pushUserIdForPayload,
-          );
+          await _pushSettlementToCloud(s, webFarmId);
           await (db.update(db.settlements)..where((t) => t.id.equals(s.id)))
               .write(const SettlementsCompanion(synced: Value(true)));
         } catch (e) {
@@ -1104,10 +652,7 @@ class SyncEngine extends ChangeNotifier {
         }
       }
 
-      await _pushHealthSchedules(
-        webFarmId,
-        pushUserIdForPayload: pushUserIdForPayload,
-      );
+      await _pushHealthSchedules(webFarmId);
       await _pushFarmSettings(webFarmId);
     } catch (e) {
       debugPrint("Push Changes overall error: $e");
@@ -1115,80 +660,82 @@ class SyncEngine extends ChangeNotifier {
     debugPrint('--- SYNC PUSH END ---');
   }
 
-  Future<void> _pushDeletions() async {
+  Future<void> _pushDeletions({String? webFarmId}) async {
     final pending = await db.select(db.pendingDeletions).get();
     for (var d in pending) {
       try {
-        // Table names in Supabase are sometimes different (e.g. mortality vs mortalities)
-        String remoteTable = d.targetTableName;
-        if (remoteTable == 'mortalities') remoteTable = 'mortality';
-        if (remoteTable == 'feeding_logs') remoteTable = 'daily_feeding_logs';
-        if (remoteTable == 'egg_productions') remoteTable = 'egg_production';
+        _requireNestApi();
+        final id = safeIdString(d.recordId);
+        final farmId = _remoteFarmIdForPush(d.farmId, webFarmId);
+        final table = d.targetTableName.trim().toLowerCase();
 
-        await _supabase
-            .from(remoteTable)
-            .delete()
-            .eq('id', safeIdString(d.recordId));
+        switch (table) {
+          case 'mortalities':
+          case 'mortality':
+            await _hatchlogApi.deleteMortality(id);
+            break;
+          case 'feeding_logs':
+          case 'daily_feeding_logs':
+            await _hatchlogApi.deleteFeeding(id);
+            break;
+          case 'egg_productions':
+          case 'egg_production':
+            await _hatchlogApi.deleteEgg(id);
+            break;
+          case 'inventory':
+            await _hatchlogApi.deleteInventory(
+              id,
+              farmId,
+              reason: 'Deleted from desktop sync',
+            );
+            break;
+          case 'sales':
+            await _hatchlogApi.deleteSale(
+              id,
+              farmId,
+              reason: 'Deleted from desktop sync',
+            );
+            break;
+          case 'expenses':
+            await _hatchlogApi.deleteExpense(id, farmId);
+            break;
+          case 'batches':
+          case 'livestock':
+            await _hatchlogApi.deleteLivestock(
+              id,
+              'Deleted from desktop sync',
+            );
+            break;
+          case 'customers':
+            await _hatchlogApi.deleteCustomer(id, farmId);
+            break;
+          case 'feed_formulations':
+            await _hatchlogApi.deleteFeedFormulation(id, farmId);
+            break;
+          case 'houses':
+            await _hatchlogApi.deleteHouse(id);
+            break;
+          default:
+            debugPrint(
+              'WARN: Skipping unknown pending deletion table '
+              '"${d.targetTableName}" ID $id (no Nest helper)',
+            );
+            continue;
+        }
+
         await (db.delete(
           db.pendingDeletions,
         )..where((t) => t.id.equals(d.id))).go();
-        debugPrint("Deleted remote record: $remoteTable ID ${d.recordId}");
+        debugPrint('Deleted remote record via Nest: $table ID $id');
       } catch (e) {
         debugPrint(
-          "Deletion sync error for ${d.targetTableName} ID ${d.recordId}: $e",
+          'Deletion sync error for ${d.targetTableName} ID ${d.recordId}: $e',
         );
       }
     }
   }
 
-  Future<void> _pushSaleItems(String? webFarmId) async {
-    final pendingItems = await db.customSelect(
-      'SELECT * FROM sale_items WHERE synced = 0',
-      readsFrom: {},
-    ).get();
-
-    for (final row in pendingItems) {
-      try {
-        final id = safeIdString(row.read<String>('id'));
-        final saleId = safeIdString(row.read<String>('sale_id'));
-        final farmId = safeIdString(row.read<String>('farm_id'));
-        final existing = await _supabase
-            .from('sale_items')
-            .select('id')
-            .eq('id', id)
-            .maybeSingle();
-        final payload = {
-          'id': id,
-          'saleId': saleId,
-          'farmId': _remoteFarmIdForPush(farmId, webFarmId),
-          'description': row.read<String>('description'),
-          'quantity': row.read<int>('quantity'),
-          'unitPrice': row.read<double>('unit_price'),
-          'totalPrice': row.read<double>('total_price'),
-          'inventoryId': _safeStr(row.read<String?>('inventory_id')),
-          'livestockId': _safeStr(row.read<String?>('livestock_id')),
-        };
-        assertSyncPayloadUsesStringIds(payload);
-
-        if (existing != null) {
-          await _supabase.from('sale_items').update(payload).eq('id', id);
-        } else {
-          await _supabase.from('sale_items').insert(payload);
-        }
-        await db.customStatement(
-          'UPDATE sale_items SET synced = 1 WHERE id = ?',
-          [id],
-        );
-      } catch (e) {
-        debugPrint('Sale item push error: $e');
-      }
-    }
-  }
-
-  Future<void> _pushFinancialTransactions(
-    String? webFarmId, {
-    required String? Function(String? localUserId) pushUserIdForPayload,
-  }) async {
+  Future<void> _pushFinancialTransactions(String? webFarmId) async {
     final pendingRows = await db.customSelect(
       'SELECT * FROM financial_transactions WHERE synced = 0 AND is_deleted = 0',
       readsFrom: {},
@@ -1198,37 +745,23 @@ class SyncEngine extends ChangeNotifier {
       try {
         final id = safeIdString(row.read<String>('id'));
         final farmId = safeIdString(row.read<String>('farm_id'));
-        final existing = await _supabase
-            .from('financial_transactions')
-            .select('id')
-            .eq('id', id)
-            .maybeSingle();
-        final now = DateTime.now().toUtc().toIso8601String();
+        final remoteFarmId = _remoteFarmIdForPush(farmId, webFarmId);
+        _requireNestApi();
+        final paymentMethod =
+            _safeStr(row.read<String?>('payment_method')) ?? 'Cash';
         final payload = {
-          'id': id,
-          'farm_id': _remoteFarmIdForPush(farmId, webFarmId),
-          'user_id': pushUserIdForPayload(_safeStr(row.read<String?>('user_id'))),
+          'farm_id': remoteFarmId,
           'type': row.read<String>('type'),
           'category': row.read<String>('category'),
           'amount': row.read<double>('amount'),
-          'payment_status': row.read<String>('payment_status'),
-          'payment_method': row.read<String?>('payment_method'),
-          'reference_num': row.read<String?>('reference_num'),
-          'transaction_date': row.read<String>('transaction_date'),
+          'paymentStatus': row.read<String>('payment_status'),
+          'paymentMethod': paymentMethod,
+          'referenceNum': row.read<String?>('reference_num'),
+          'transactionDate': row.read<String>('transaction_date'),
           'description': row.read<String?>('description'),
-          'updated_at': now,
         };
         assertSyncPayloadUsesStringIds(payload);
-
-        if (existing != null) {
-          await _supabase
-              .from('financial_transactions')
-              .update(payload)
-              .eq('id', id);
-        } else {
-          payload['created_at'] = now;
-          await _supabase.from('financial_transactions').insert(payload);
-        }
+        await _hatchlogApi.createLedgerTransaction(payload);
         await db.customStatement(
           'UPDATE financial_transactions SET synced = 1 WHERE id = ?',
           [id],
@@ -1245,221 +778,194 @@ class SyncEngine extends ChangeNotifier {
     final farmIdFilter = safeIdString(farmId);
 
     try {
-      final syncData = await _supabase.rpc(
-        'get_farm_sync_data',
-        params: {'p_farm_id': farmIdFilter},
-      );
-      if (syncData == null) return;
+      _requireNestApi();
 
-      // 1. Pull Houses (Nest-first when configured, fallback to Supabase RPC)
-      var housesPulledFromNest = false;
-      if (_hatchlogApi.isConfigured) {
-        try {
-          final nestHouses = await _hatchlogApi.listHouses(farmIdFilter);
-          for (var h in nestHouses) {
-            final house = h as Map<String, dynamic>;
-            await db
-                .into(db.houses)
-                .insertOnConflictUpdate(
-                  HousesCompanion.insert(
-                    id: safeIdString(house['id']),
-                    farmId: farmIdFilter,
-                    userId: Value(
-                      house['user_id'] as String? ?? house['userId'] as String?,
-                    ),
-                    name: (house['name'] ?? '') as String,
-                    capacity: _safeInt(house['capacity']) ?? 0,
-                    currentTemperature: Value(
-                      _safeDouble(
-                        house['current_temperature'] ?? house['currentTemperature'],
-                      ),
-                    ),
-                    currentHumidity: Value(
-                      _safeDouble(
-                        house['current_humidity'] ?? house['currentHumidity'],
-                      ),
-                    ),
-                    isIsolation: Value(
-                      _safeBool(
-                        house['is_isolation'] ?? house['isIsolation'],
-                        fallback: false,
-                      ),
-                    ),
-                    synced: const Value(true),
-                  ),
-                );
-          }
-          debugPrint('Pull: synced ${nestHouses.length} houses from Nest');
-          housesPulledFromNest = true;
-        } catch (e) {
-          debugPrint('WARN: Nest houses pull failed, falling back to Supabase: $e');
+      // Team-plane bootstrap (permissions only). Nest-owned tables do not use this.
+      Map<String, dynamic>? syncData;
+      try {
+        final raw = await _supabase.rpc(
+          'get_farm_sync_data',
+          params: {'p_farm_id': farmIdFilter},
+        );
+        if (raw is Map<String, dynamic>) {
+          syncData = raw;
+        } else if (raw is Map) {
+          syncData = Map<String, dynamic>.from(raw);
         }
+      } catch (e) {
+        debugPrint('WARN: get_farm_sync_data unavailable (team plane only): $e');
       }
-      if (!housesPulledFromNest) {
-        final remoteHouses = (syncData['houses'] as List<dynamic>?) ?? [];
-        for (var h in remoteHouses) {
-          await db
-              .into(db.houses)
-              .insertOnConflictUpdate(
-                HousesCompanion.insert(
-                  id: safeIdString(h['id']),
-                  farmId: farmIdFilter,
-                  userId: Value(h['userId'] as String?),
-                  name: h['name'] as String,
-                  capacity: _safeInt(h['capacity']) ?? 0,
-                  currentTemperature: Value(_safeDouble(h['currentTemperature'])),
-                  currentHumidity: Value(_safeDouble(h['currentHumidity'])),
-                  isIsolation: Value(h['isIsolation'] as bool? ?? false),
-                  synced: const Value(true),
+
+      // 1. Pull Houses (Nest required)
+      final nestHouses = await _hatchlogApi.listHouses(farmIdFilter);
+      for (var h in nestHouses) {
+        final house = h as Map<String, dynamic>;
+        await db
+            .into(db.houses)
+            .insertOnConflictUpdate(
+              HousesCompanion.insert(
+                id: safeIdString(house['id']),
+                farmId: farmIdFilter,
+                userId: Value(
+                  house['user_id'] as String? ?? house['userId'] as String?,
                 ),
-              );
-        }
-        debugPrint('Pull: synced ${remoteHouses.length} houses');
-      }
-
-      // 2. Pull Batches / Livestock (Nest-first when configured, fallback to Supabase RPC)
-      var batchesPulledFromNest = false;
-      if (_hatchlogApi.isConfigured) {
-        try {
-          final nestLivestock = await _hatchlogApi.listLivestock(farmIdFilter);
-          for (var b in nestLivestock) {
-            final batch = b as Map<String, dynamic>;
-            await db
-                .into(db.batches)
-                .insertOnConflictUpdate(
-                  BatchesCompanion.insert(
-                    id: safeIdString(batch['id']),
-                    farmId: farmIdFilter,
-                    houseId: Value(_safeStr(batch['house_id'] ?? batch['houseId'])),
-                    userId: Value(
-                      batch['user_id'] as String? ?? batch['userId'] as String?,
-                    ),
-                    batchName: Value(
-                      batch['batch_name'] as String? ??
-                          batch['batchName'] as String? ??
-                          batch['name'] as String? ??
-                          '',
-                    ),
-                    type: Value(batch['type'] as String? ?? ''),
-                    breedType: Value(
-                      batch['breed_type'] as String? ??
-                          batch['breedType'] as String?,
-                    ),
-                    status: Value(batch['status'] as String? ?? ''),
-                    arrivalDate:
-                        _safeDateTime(
-                          batch['arrival_date'] ?? batch['arrivalDate'],
-                        ) ??
-                        DateTime.now().toUtc(),
-                    currentCount:
-                        _safeInt(batch['current_count'] ?? batch['currentCount']) ??
-                        0,
-                    initialCount:
-                        _safeInt(batch['initial_count'] ?? batch['initialCount']) ??
-                        0,
-                    isolationCount: Value(
-                      _safeInt(
-                            batch['isolation_count'] ?? batch['isolationCount'],
-                          ) ??
-                          0,
-                    ),
-                    initialActualCost: Value(
-                      _safeDouble(batch['initial_actual_cost']),
-                    ),
-                    growthTarget: Value(batch['growth_target']?.toString()),
-                    synced: const Value(true),
+                name: (house['name'] ?? '') as String,
+                capacity: _safeInt(house['capacity']) ?? 0,
+                currentTemperature: Value(
+                  _safeDouble(
+                    house['current_temperature'] ?? house['currentTemperature'],
                   ),
-                );
-          }
-          debugPrint('Pull: synced ${nestLivestock.length} livestock from Nest');
-          batchesPulledFromNest = true;
-        } catch (e) {
-          debugPrint('WARN: Nest livestock pull failed, falling back to Supabase: $e');
-        }
-      }
-      if (!batchesPulledFromNest) {
-        final remoteBatches = (syncData['batches'] as List<dynamic>?) ?? [];
-        for (var rb in remoteBatches) {
-          await db
-              .into(db.batches)
-              .insertOnConflictUpdate(
-                BatchesCompanion.insert(
-                  id: safeIdString(rb['id']),
-                  farmId: farmIdFilter,
-                  houseId: Value(_safeStr(rb['houseId'] ?? rb['house_id'])),
-                  userId: Value(rb['userId'] as String?),
-                  batchName: Value(rb['batchName'] as String? ?? ''),
-                  type: Value(rb['type'] as String? ?? ''),
-                  breedType: Value(rb['breedType'] as String?),
-                  status: Value(rb['status'] as String? ?? ''),
-                  arrivalDate:
-                      _safeDateTime(rb['arrivalDate']) ?? DateTime.now().toUtc(),
-                  currentCount: _safeInt(rb['currentCount']) ?? 0,
-                  initialCount: _safeInt(rb['initialCount']) ?? 0,
-                  isolationCount: Value(_safeInt(rb['isolationCount']) ?? 0),
-                  initialActualCost: Value(
-                    _safeDouble(rb['initial_actual_cost']),
-                  ),
-                  growthTarget: Value(rb['growth_target']?.toString()),
-                  synced: const Value(true),
                 ),
-              );
-        }
-        debugPrint('Pull: synced ${remoteBatches.length} batches');
+                currentHumidity: Value(
+                  _safeDouble(
+                    house['current_humidity'] ?? house['currentHumidity'],
+                  ),
+                ),
+                isIsolation: Value(
+                  _safeBool(
+                    house['is_isolation'] ?? house['isIsolation'],
+                    fallback: false,
+                  ),
+                ),
+                synced: const Value(true),
+              ),
+            );
       }
+      debugPrint('Pull: synced ${nestHouses.length} houses from Nest');
 
-      // 3. Pull Inventory
-      final remoteInventory = (syncData['inventory'] as List<dynamic>?) ?? [];
-      for (var i in remoteInventory) {
+      // 2. Pull Batches / Livestock (Nest required)
+      final nestLivestock = await _hatchlogApi.listLivestock(farmIdFilter);
+      for (var b in nestLivestock) {
+        final batch = b as Map<String, dynamic>;
+        await db
+            .into(db.batches)
+            .insertOnConflictUpdate(
+              BatchesCompanion.insert(
+                id: safeIdString(batch['id']),
+                farmId: farmIdFilter,
+                houseId: Value(_safeStr(batch['house_id'] ?? batch['houseId'])),
+                userId: Value(
+                  batch['user_id'] as String? ?? batch['userId'] as String?,
+                ),
+                batchName: Value(
+                  batch['batch_name'] as String? ??
+                      batch['batchName'] as String? ??
+                      batch['name'] as String? ??
+                      '',
+                ),
+                type: Value(batch['type'] as String? ?? ''),
+                breedType: Value(
+                  batch['breed_type'] as String? ??
+                      batch['breedType'] as String?,
+                ),
+                status: Value(batch['status'] as String? ?? ''),
+                arrivalDate:
+                    _safeDateTime(
+                      batch['arrival_date'] ?? batch['arrivalDate'],
+                    ) ??
+                    DateTime.now().toUtc(),
+                currentCount:
+                    _safeInt(batch['current_count'] ?? batch['currentCount']) ??
+                    0,
+                initialCount:
+                    _safeInt(batch['initial_count'] ?? batch['initialCount']) ??
+                    0,
+                isolationCount: Value(
+                  _safeInt(
+                        batch['isolation_count'] ?? batch['isolationCount'],
+                      ) ??
+                      0,
+                ),
+                initialActualCost: Value(
+                  _safeDouble(batch['initial_actual_cost']),
+                ),
+                growthTarget: Value(batch['growth_target']?.toString()),
+                synced: const Value(true),
+              ),
+            );
+      }
+      debugPrint('Pull: synced ${nestLivestock.length} livestock from Nest');
+
+      // 3. Pull Inventory (Nest required)
+      final nestInventory = await _hatchlogApi.listInventory(farmIdFilter);
+      for (var i in nestInventory) {
+        final row = Map<String, dynamic>.from(i as Map);
         await db
             .into(db.inventory)
             .insertOnConflictUpdate(
               InventoryCompanion.insert(
-                id: safeIdString(i['id']),
+                id: safeIdString(row['id']),
                 farmId: farmIdFilter,
-                userId: Value(i['userId'] as String?),
-                itemName: i['itemName'] as String,
-                stockLevel: _safeDouble(i['stockLevel']) ?? 0.0,
-                reorderLevel: Value(_safeDouble(i['reorderLevel'])),
-                unit: i['unit'] as String,
-                category: Value(i['category'] as String?),
-                costPerUnit: Value(_safeDouble(i['costPerUnit'])),
-                eggCategoryId: Value(_safeStr(i['eggCategoryId'])),
+                userId: Value(
+                  (row['userId'] ?? row['user_id']) as String?,
+                ),
+                itemName: (row['itemName'] ?? row['item_name'] ?? '') as String,
+                stockLevel:
+                    _safeDouble(row['stockLevel'] ?? row['stock_level']) ?? 0.0,
+                reorderLevel: Value(
+                  _safeDouble(row['reorderLevel'] ?? row['reorder_level']),
+                ),
+                unit: (row['unit'] ?? 'bags') as String,
+                category: Value(
+                  (row['category'] as String?) ?? 'other',
+                ),
+                costPerUnit: Value(
+                  _safeDouble(row['costPerUnit'] ?? row['cost_per_unit']),
+                ),
+                eggCategoryId: Value(
+                  _safeStr(row['eggCategoryId'] ?? row['egg_category_id']),
+                ),
                 synced: const Value(true),
               ),
             );
       }
-      debugPrint('Pull: synced ${remoteInventory.length} inventory items');
+      debugPrint(
+        'Pull: synced ${nestInventory.length} inventory items from Nest',
+      );
 
-      // 4. Pull Customers
-      final remoteCustomers = (syncData['customers'] as List<dynamic>?) ?? [];
-      for (var c in remoteCustomers) {
+      // 4. Pull Customers (Nest required)
+      final nestCustomers = await _hatchlogApi.listCustomers(farmIdFilter);
+      for (var c in nestCustomers) {
+        final row = Map<String, dynamic>.from(c as Map);
         await db
             .into(db.customers)
             .insertOnConflictUpdate(
               CustomersCompanion.insert(
-                id: safeIdString(c['id']),
+                id: safeIdString(row['id']),
                 farmId: farmIdFilter,
-                name: c['name'] as String,
-                phone: Value(c['phone'] as String?),
-                email: Value(c['email'] as String?),
-                address: Value(c['address'] as String?),
-                customerType: Value(c['customerType'] as String? ?? 'CUSTOMER'),
-                balanceOwed: Value(_safeDouble(c['balanceOwed']) ?? 0.0),
-                supplyItems: Value(c['supplyItems'] as String?),
-                contactPerson: Value(c['contactPerson'] as String?),
+                name: (row['name'] ?? '') as String,
+                phone: Value(_safeStr(row['phone'])),
+                email: Value(_safeStr(row['email'])),
+                address: Value(_safeStr(row['address'])),
+                customerType: Value(
+                  (row['customerType'] ?? row['customer_type'] ?? 'CUSTOMER')
+                      as String,
+                ),
+                balanceOwed: Value(
+                  _safeDouble(
+                        row['balanceOwed'] ?? row['balance_owed'],
+                      ) ??
+                      0.0,
+                ),
+                supplyItems: Value(
+                  _safeStr(row['supplyItems'] ?? row['supply_items']),
+                ),
+                contactPerson: Value(
+                  _safeStr(row['contactPerson'] ?? row['contact_person']),
+                ),
                 synced: const Value(true),
               ),
             );
       }
-      debugPrint('Pull: synced ${remoteCustomers.length} customers');
+      debugPrint('Pull: synced ${nestCustomers.length} customers from Nest');
 
       await _syncSuppliersFromCloud(farmIdFilter);
       await _syncFeedFormulationsFromCloud(farmIdFilter);
+      await _syncSalesFromCloud(farmIdFilter);
 
-      // 4.1 Pull User Permissions (if provided by RPC)
+      // 4.1 Pull User Permissions (Supabase team plane)
       final remotePermissions =
-          (syncData['user_permissions'] as List<dynamic>?) ?? [];
+          (syncData?['user_permissions'] as List<dynamic>?) ?? [];
       for (var p in remotePermissions) {
         final perm = p as Map<String, dynamic>;
         await db
@@ -1482,77 +988,96 @@ class SyncEngine extends ChangeNotifier {
       }
       debugPrint('Pull: synced ${remotePermissions.length} user permissions');
 
-      // 5. Pull Mortality (direct table query)
-      final remoteMortality = await _supabase
-          .from('mortality')
-          .select()
-          .eq('farmId', farmIdFilter);
+      // 5. Pull Mortality (Nest required)
+      final remoteMortality = await _hatchlogApi.listMortality(farmIdFilter);
       for (var m in remoteMortality) {
+        final row = Map<String, dynamic>.from(m as Map);
         await db
             .into(db.mortalities)
             .insertOnConflictUpdate(
               MortalitiesCompanion.insert(
-                id: safeIdString(m['id']),
+                id: safeIdString(row['id']),
                 farmId: farmIdFilter,
-                batchId: safeIdString(m['batch_id'] ?? m['batchId']),
-                count: m['count'] as int,
-                reason: Value(m['reason'] as String?),
-                category: Value(m['category'] as String?),
-                subCategory: Value(m['sub_category'] as String?),
+                batchId: safeIdString(row['batch_id'] ?? row['batchId']),
+                count: row['count'] as int,
+                reason: Value(row['reason'] as String?),
+                category: Value(row['category'] as String?),
+                subCategory: Value(
+                  (row['sub_category'] ?? row['subCategory']) as String?,
+                ),
                 healthType: Value(
-                  (m['type'] as String?)?.toUpperCase() == 'SICK'
+                  (row['type'] as String?)?.toUpperCase() == 'SICK'
                       ? 'SICK'
                       : 'DEAD',
                 ),
                 isolationRoomId: Value(
-                  _safeStr(m['isolation_room_id'] ?? m['isolationRoomId']),
+                  _safeStr(row['isolation_room_id'] ?? row['isolationRoomId']),
                 ),
-                logDate: _safeDateTime(m['logDate']) ?? DateTime.now().toUtc(),
-                userId: Value(m['user_id'] as String?),
+                logDate:
+                    _safeDateTime(row['logDate'] ?? row['log_date']) ??
+                    DateTime.now().toUtc(),
+                userId: Value(
+                  (row['user_id'] ?? row['userId']) as String?,
+                ),
                 synced: const Value(true),
               ),
             );
       }
       debugPrint('Pull: synced ${remoteMortality.length} mortality records');
 
-      // 6. Pull Egg Production (direct table query)
-      final remoteEggs = await _supabase
-          .from('egg_production')
-          .select()
-          .eq('farmId', farmIdFilter);
+      // 6. Pull Egg Production (Nest required)
+      final remoteEggs = await _hatchlogApi.listEggs(farmIdFilter);
       for (var e in remoteEggs) {
+        final row = Map<String, dynamic>.from(e as Map);
         await db
             .into(db.eggProductions)
             .insertOnConflictUpdate(
               EggProductionsCompanion.insert(
-                id: safeIdString(e['id']),
+                id: safeIdString(row['id']),
                 farmId: farmIdFilter,
-                batchId: safeIdString(e['batchId'] ?? e['batch_id']),
+                batchId: safeIdString(row['batchId'] ?? row['batch_id']),
                 categoryId: Value(
-                  _safeStr(e['categoryId'] ?? e['category_id']),
+                  _safeStr(row['categoryId'] ?? row['category_id']),
                 ),
-                eggsCollected: e['eggsCollected'] as int,
-                unusableCount: Value(e['unusableCount'] as int? ?? 0),
-                eggsRemaining: Value(e['eggsRemaining'] as int? ?? 0),
-                cratesCollected: Value(_safeDouble(e['cratesCollected'])),
-                qualityGrade: Value(e['qualityGrade'] as String?),
-                isSorted: Value(e['isSorted'] as bool? ?? false),
-                smallCount: Value(e['smallCount'] as int? ?? 0),
-                mediumCount: Value(e['mediumCount'] as int? ?? 0),
-                largeCount: Value(e['largeCount'] as int? ?? 0),
-                logDate: _safeDateTime(e['logDate']) ?? DateTime.now().toUtc(),
-                userId: Value(e['userId'] as String?),
+                eggsCollected: (row['eggsCollected'] ?? row['eggs_collected']) as int,
+                unusableCount: Value(
+                  (row['unusableCount'] ?? row['unusable_count']) as int? ?? 0,
+                ),
+                eggsRemaining: Value(
+                  (row['eggsRemaining'] ?? row['eggs_remaining']) as int? ?? 0,
+                ),
+                cratesCollected: Value(
+                  _safeDouble(row['cratesCollected'] ?? row['crates_collected']),
+                ),
+                qualityGrade: Value(
+                  (row['qualityGrade'] ?? row['quality_grade']) as String?,
+                ),
+                isSorted: Value(
+                  (row['isSorted'] ?? row['is_sorted']) as bool? ?? false,
+                ),
+                smallCount: Value(
+                  (row['smallCount'] ?? row['small_count']) as int? ?? 0,
+                ),
+                mediumCount: Value(
+                  (row['mediumCount'] ?? row['medium_count']) as int? ?? 0,
+                ),
+                largeCount: Value(
+                  (row['largeCount'] ?? row['large_count']) as int? ?? 0,
+                ),
+                logDate:
+                    _safeDateTime(row['logDate'] ?? row['log_date']) ??
+                    DateTime.now().toUtc(),
+                userId: Value((row['userId'] ?? row['user_id']) as String?),
                 synced: const Value(true),
               ),
             );
       }
       debugPrint('Pull: synced ${remoteEggs.length} egg production records');
 
-      final remoteEggCategories = await _supabase
-          .from('egg_categories')
-          .select()
-          .eq('farmId', farmIdFilter);
-      for (final category in remoteEggCategories) {
+      final remoteEggCategories =
+          await _hatchlogApi.listEggCategories(farmIdFilter);
+      for (final raw in remoteEggCategories) {
+        final category = Map<String, dynamic>.from(raw as Map);
         final id = safeIdString(category['id']);
         await db.customInsert(
           'INSERT OR REPLACE INTO egg_categories (id, farm_id, name, selling_price, unit_size) VALUES (?, ?, ?, ?, ?)',
@@ -1560,8 +1085,15 @@ class SyncEngine extends ChangeNotifier {
             Variable.withString(id),
             Variable.withString(farmIdFilter),
             Variable.withString(category['name'] as String? ?? 'Eggs'),
-            Variable(_safeDouble(category['sellingPrice']) ?? 0),
-            Variable.withInt(category['unitSize'] as int? ?? 30),
+            Variable(
+              _safeDouble(
+                    category['sellingPrice'] ?? category['selling_price'],
+                  ) ??
+                  0,
+            ),
+            Variable.withInt(
+              _safeInt(category['unitSize'] ?? category['unit_size']) ?? 30,
+            ),
           ],
         );
       }
@@ -1569,28 +1101,32 @@ class SyncEngine extends ChangeNotifier {
         'Pull: synced ${remoteEggCategories.length} egg categories',
       );
 
-      // 7. Pull Feeding Logs (direct table query)
-      final remoteFeeds = await _supabase
-          .from('daily_feeding_logs')
-          .select()
-          .eq('farmId', farmIdFilter);
+      // 7. Pull Feeding Logs (Nest required)
+      final remoteFeeds = await _hatchlogApi.listFeeding(farmIdFilter);
       for (var f in remoteFeeds) {
+        final row = Map<String, dynamic>.from(f as Map);
         await db
             .into(db.feedingLogs)
             .insertOnConflictUpdate(
               FeedingLogsCompanion.insert(
-                id: safeIdString(f['id']),
+                id: safeIdString(row['id']),
                 farmId: farmIdFilter,
-                batchId: Value(_safeStr(f['batch_id'] ?? f['batchId'])),
+                batchId: Value(_safeStr(row['batch_id'] ?? row['batchId'])),
                 feedTypeId: Value(
-                  _safeStr(f['feed_type_id'] ?? f['feedTypeId']),
+                  _safeStr(row['feed_type_id'] ?? row['feedTypeId']),
                 ),
                 formulationId: Value(
-                  _safeStr(f['formulation_id'] ?? f['formulationId']),
+                  _safeStr(row['formulation_id'] ?? row['formulationId']),
                 ),
-                amountConsumed: _safeDouble(f['amount_consumed']) ?? 0.0,
-                logDate: _safeDateTime(f['log_date']) ?? DateTime.now().toUtc(),
-                userId: Value(f['user_id'] as String?),
+                amountConsumed:
+                    _safeDouble(
+                      row['amount_consumed'] ?? row['amountConsumed'],
+                    ) ??
+                    0.0,
+                logDate:
+                    _safeDateTime(row['log_date'] ?? row['logDate']) ??
+                    DateTime.now().toUtc(),
+                userId: Value((row['user_id'] ?? row['userId']) as String?),
                 synced: const Value(true),
               ),
             );
@@ -1600,27 +1136,29 @@ class SyncEngine extends ChangeNotifier {
       // 8. Pull Users and Farm Members
       await _syncFarmMembersFromCloud(farmIdFilter);
 
-      // 9. Pull Expenses
-      final remoteExpenses = await _supabase
-          .from('expenses')
-          .select()
-          .eq('farmId', farmIdFilter);
+      // 9. Pull Expenses (Nest required)
+      final remoteExpenses = await _hatchlogApi.listExpenses(farmIdFilter);
       for (var e in remoteExpenses) {
-        final description = _safeStr(e['description']);
+        final row = Map<String, dynamic>.from(e as Map);
+        final description = _safeStr(row['description']);
         await db
             .into(db.expenses)
             .insertOnConflictUpdate(
               ExpensesCompanion.insert(
-                id: safeIdString(e['id']),
+                id: safeIdString(row['id']),
                 farmId: farmIdFilter,
-                batchId: Value(_safeStr(e['batch_id'] ?? e['batchId'])),
+                batchId: Value(_safeStr(row['batch_id'] ?? row['batchId'])),
                 supplierId: Value(
-                  _safeStr(e['supplierId'] ?? e['supplier_id']),
+                  _safeStr(row['supplierId'] ?? row['supplier_id']),
                 ),
-                category: e['category'] as String,
-                amount: _safeDouble(e['amount']) ?? 0.0,
+                category: (row['category'] as String?) ?? 'OTHER',
+                amount: _safeDouble(row['amount']) ?? 0.0,
                 date: Value(
-                  _safeDateTime(e['expense_date'] ?? e['date']) ??
+                  _safeDateTime(
+                        row['expense_date'] ??
+                            row['expenseDate'] ??
+                            row['date'],
+                      ) ??
                       DateTime.now().toUtc(),
                 ),
                 description: Value(description),
@@ -1633,7 +1171,7 @@ class SyncEngine extends ChangeNotifier {
                 isSharedAllocation: Value(
                   _isSharedAllocationDescription(description),
                 ),
-                userId: Value(_safeStr(e['user_id'] ?? e['userId'])),
+                userId: Value(_safeStr(row['user_id'] ?? row['userId'])),
                 synced: const Value(true),
               ),
             );
@@ -1918,25 +1456,30 @@ class SyncEngine extends ChangeNotifier {
   }
 
   Future<void> _syncSuppliersFromCloud(String farmIdFilter) async {
-    final remoteSuppliers = await _supabase
-        .from('suppliers')
-        .select()
-        .eq('farmId', farmIdFilter);
+    _requireNestApi();
+    final remoteSuppliers = await _hatchlogApi.listSuppliers(farmIdFilter);
     for (var s in remoteSuppliers) {
+      final row = Map<String, dynamic>.from(s as Map);
       await db
           .into(db.customers)
           .insertOnConflictUpdate(
             CustomersCompanion.insert(
-              id: safeIdString(s['id']),
+              id: safeIdString(row['id']),
               farmId: farmIdFilter,
-              name: s['name'] as String,
-              phone: Value(_safeStr(s['phone'])),
-              email: Value(_safeStr(s['email'])),
-              address: Value(_safeStr(s['address'])),
-              balanceOwed: Value(_safeDouble(s['balanceOwed']) ?? 0.0),
+              name: (row['name'] ?? '') as String,
+              phone: Value(_safeStr(row['phone'])),
+              email: Value(_safeStr(row['email'])),
+              address: Value(_safeStr(row['address'])),
+              balanceOwed: Value(
+                _safeDouble(row['balanceOwed'] ?? row['balance_owed']) ?? 0.0,
+              ),
               customerType: const Value('SUPPLIER'),
-              supplyItems: Value(_safeStr(s['supplyItems'])),
-              contactPerson: Value(_safeStr(s['contactPerson'])),
+              supplyItems: Value(
+                _safeStr(row['supplyItems'] ?? row['supply_items']),
+              ),
+              contactPerson: Value(
+                _safeStr(row['contactPerson'] ?? row['contact_person']),
+              ),
               synced: const Value(true),
             ),
           );
@@ -1944,58 +1487,96 @@ class SyncEngine extends ChangeNotifier {
     debugPrint('Pull: synced ${remoteSuppliers.length} suppliers');
   }
 
+  Future<void> _syncSalesFromCloud(String farmIdFilter) async {
+    _requireNestApi();
+    final remoteSales = await _hatchlogApi.listSales(farmIdFilter);
+    for (final raw in remoteSales) {
+      final row = Map<String, dynamic>.from(raw as Map);
+      final total =
+          _safeDouble(row['totalAmount'] ?? row['total_amount']) ?? 0.0;
+      await db.into(db.sales).insertOnConflictUpdate(
+        SalesCompanion.insert(
+          id: safeIdString(row['id']),
+          farmId: farmIdFilter,
+          customerId: Value(
+            _safeStr(row['customerId'] ?? row['customer_id']),
+          ),
+          userId: Value(_safeStr(row['userId'] ?? row['user_id'])),
+          quantity: 1,
+          unitPrice: total,
+          totalAmount: total,
+          saleDate: Value(
+            _safeDateTime(row['saleDate'] ?? row['sale_date']) ??
+                DateTime.now().toUtc(),
+          ),
+          synced: const Value(true),
+        ),
+      );
+    }
+    debugPrint('Pull: synced ${remoteSales.length} sales from Nest');
+  }
+
   Future<void> _syncFeedFormulationsFromCloud(String farmIdFilter) async {
-    final remoteFormulations = await _supabase
-        .from('feed_formulations')
-        .select()
-        .eq('farmId', farmIdFilter);
-    final formulationIds = <String>[];
-    for (final row in remoteFormulations) {
+    _requireNestApi();
+    final nestFormulations =
+        await _hatchlogApi.listFeedFormulations(farmIdFilter);
+    var ingredientCount = 0;
+    for (final raw in nestFormulations) {
+      final row = Map<String, dynamic>.from(raw as Map);
       final id = safeIdString(row['id']);
-      formulationIds.add(id);
       await db.into(db.feedFormulations).insertOnConflictUpdate(
         FeedFormulationsCompanion.insert(
           id: id,
           farmId: farmIdFilter,
-          name: row['name'] as String,
+          name: (row['name'] ?? '') as String,
           notes: Value(_safeStr(row['notes'])),
           type: Value(_safeStr(row['type']) ?? 'CUSTOM'),
-          targetLivestock: Value(_safeStr(row['targetLivestock'])),
-          stockLevel: Value(_safeDouble(row['stockLevel']) ?? 0),
+          targetLivestock: Value(
+            _safeStr(row['targetLivestock'] ?? row['target_livestock']),
+          ),
+          stockLevel: Value(
+            _safeDouble(row['stockLevel'] ?? row['stock_level']) ?? 0,
+          ),
           createdAt: Value(
-            DateTime.tryParse(_safeStr(row['createdAt']) ?? '') ?? DateTime.now(),
+            DateTime.tryParse(
+                  _safeStr(row['createdAt'] ?? row['created_at']) ?? '',
+                ) ??
+                DateTime.now(),
           ),
           updatedAt: Value(
-            DateTime.tryParse(_safeStr(row['updatedAt']) ?? '') ?? DateTime.now(),
+            DateTime.tryParse(
+                  _safeStr(row['updatedAt'] ?? row['updated_at']) ?? '',
+                ) ??
+                DateTime.now(),
           ),
           synced: const Value(true),
         ),
       );
-    }
-    debugPrint('Pull: synced ${remoteFormulations.length} feed formulations');
-
-    if (formulationIds.isEmpty) {
-      return;
-    }
-
-    final remoteIngredients = await _supabase
-        .from('feed_formulation_ingredients')
-        .select()
-        .inFilter('formulationId', formulationIds);
-    for (final row in remoteIngredients) {
-      await db.into(db.feedFormulationIngredients).insertOnConflictUpdate(
-        FeedFormulationIngredientsCompanion.insert(
-          id: safeIdString(row['id']),
-          formulationId: safeIdString(row['formulationId']),
-          inventoryId: safeIdString(row['inventoryId']),
-          quantity: _safeDouble(row['quantity']) ?? 0,
-          unit: Value(_safeStr(row['unit']) ?? 'bag'),
-          synced: const Value(true),
-        ),
-      );
+      final ingredients = (row['ingredients'] as List?) ?? const [];
+      for (final ingRaw in ingredients) {
+        final ing = Map<String, dynamic>.from(ingRaw as Map);
+        final inventoryId = _safeStr(
+          ing['inventoryId'] ?? ing['inventory_id'],
+        );
+        if (inventoryId == null || inventoryId.isEmpty) continue;
+        await db.into(db.feedFormulationIngredients).insertOnConflictUpdate(
+          FeedFormulationIngredientsCompanion.insert(
+            id: safeIdString(ing['id'] ?? '${id}_$inventoryId'),
+            formulationId: id,
+            inventoryId: inventoryId,
+            quantity: _safeDouble(ing['quantity']) ?? 0,
+            unit: Value(_safeStr(ing['unit']) ?? 'bag'),
+            synced: const Value(true),
+          ),
+        );
+        ingredientCount++;
+      }
     }
     debugPrint(
-      'Pull: synced ${remoteIngredients.length} feed formulation ingredients',
+      'Pull: synced ${nestFormulations.length} feed formulations from Nest',
+    );
+    debugPrint(
+      'Pull: synced $ingredientCount feed formulation ingredients from Nest',
     );
   }
 
@@ -2003,29 +1584,20 @@ class SyncEngine extends ChangeNotifier {
     Customer c,
     String? webFarmId,
   ) async {
+    _requireNestApi();
     final id = safeIdString(c.id);
-    final existing = await _supabase
-        .from('customers')
-        .select('id')
-        .eq('id', id)
-        .maybeSingle();
-    final now = DateTime.now().toUtc().toIso8601String();
-    final payload = {
-      'id': id,
-      'farmId': _remoteFarmIdForPush(c.farmId, webFarmId),
+    final remoteFarmId = _remoteFarmIdForPush(c.farmId, webFarmId);
+    final body = {
+      'farm_id': remoteFarmId,
       'name': c.name,
-      'phone': c.phone,
-      'email': c.email,
-      'address': c.address,
-      'balanceOwed': c.balanceOwed,
-      'updatedAt': now,
+      if (c.phone != null && c.phone!.trim().isNotEmpty) 'phone': c.phone,
+      if (c.email != null && c.email!.trim().isNotEmpty) 'email': c.email,
+      if (c.address != null && c.address!.trim().isNotEmpty) 'address': c.address,
     };
-    assertSyncPayloadUsesStringIds(payload);
-    if (existing != null) {
-      await _supabase.from('customers').update(payload).eq('id', id);
-    } else {
-      payload['createdAt'] = now;
-      await _supabase.from('customers').insert(payload);
+    try {
+      await _hatchlogApi.createCustomer(body);
+    } catch (_) {
+      await _hatchlogApi.updateCustomer(id, body);
     }
   }
 
@@ -2033,37 +1605,27 @@ class SyncEngine extends ChangeNotifier {
     Customer c,
     String? webFarmId,
   ) async {
+    _requireNestApi();
     final id = safeIdString(c.id);
-    final existing = await _supabase
-        .from('suppliers')
-        .select('id')
-        .eq('id', id)
-        .maybeSingle();
-    final now = DateTime.now().toUtc().toIso8601String();
-    final payload = {
-      'id': id,
-      'farmId': _remoteFarmIdForPush(c.farmId, webFarmId),
+    final remoteFarmId = _remoteFarmIdForPush(c.farmId, webFarmId);
+    final body = {
+      'farm_id': remoteFarmId,
       'name': c.name,
-      'phone': c.phone,
-      'email': c.email,
-      'address': c.address,
-      'balanceOwed': c.balanceOwed,
-      'updatedAt': now,
+      if (c.phone != null && c.phone!.trim().isNotEmpty) 'phone': c.phone,
+      if (c.email != null && c.email!.trim().isNotEmpty) 'email': c.email,
+      if (c.address != null && c.address!.trim().isNotEmpty) 'address': c.address,
     };
-    assertSyncPayloadUsesStringIds(payload);
-    if (existing != null) {
-      await _supabase.from('suppliers').update(payload).eq('id', id);
-    } else {
-      payload['createdAt'] = now;
-      await _supabase.from('suppliers').insert(payload);
+    try {
+      await _hatchlogApi.createSupplier(body);
+    } catch (_) {
+      await _hatchlogApi.updateSupplier(id, body);
     }
   }
 
   Future<void> _pushSettlementToCloud(
     Settlement s,
-    String? webFarmId, {
-    required String? Function(String? localUserId) pushUserIdForPayload,
-  }) async {
+    String? webFarmId,
+  ) async {
     final customer = await (db.select(
       db.customers,
     )..where((t) => t.id.equals(s.customerId))).getSingleOrNull();
@@ -2077,37 +1639,17 @@ class SyncEngine extends ChangeNotifier {
           .write(const CustomersCompanion(synced: Value(true)));
     }
 
-    final expenseId = 'stl_${safeIdString(s.id)}';
-    final now = DateTime.now().toUtc().toIso8601String();
-    final expensePayload = {
-      'id': expenseId,
-      'farmId': _remoteFarmIdForPush(s.farmId, webFarmId),
-      'user_id': pushUserIdForPayload(s.userId),
-      'supplierId': customer?.customerType == 'SUPPLIER'
-          ? optionalIdString(s.customerId)
-          : null,
-      'category': _settlementExpenseCategory(s.settlementType),
+    final remoteFarmId = _remoteFarmIdForPush(s.farmId, webFarmId);
+    final description =
+        'Settlement ${s.settlementType} (${customer?.customerType == 'SUPPLIER' ? 'supplier' : 'customer'} ${s.customerId})';
+    _requireNestApi();
+    await _hatchlogApi.createExpense({
+      'farm_id': remoteFarmId,
       'amount': s.amount,
-      'expense_date': s.settlementDate.toIso8601String(),
-      'description':
-          'Settlement ${s.settlementType} (${customer?.customerType == 'SUPPLIER' ? 'supplier' : 'customer'} ${s.customerId})',
-      'created_at': now,
-      'updated_at': now,
-    };
-    assertSyncPayloadUsesStringIds(expensePayload);
-    final existing = await _supabase
-        .from('expenses')
-        .select('id')
-        .eq('id', expenseId)
-        .maybeSingle();
-    if (existing != null) {
-      await _supabase
-          .from('expenses')
-          .update(expensePayload)
-          .eq('id', expenseId);
-    } else {
-      await _supabase.from('expenses').insert(expensePayload);
-    }
+      'category': _settlementExpenseCategory(s.settlementType),
+      'description': description,
+      'expenseDate': s.settlementDate.toIso8601String(),
+    });
   }
 
   String _settlementExpenseCategory(String settlementType) {
@@ -2139,115 +1681,86 @@ class SyncEngine extends ChangeNotifier {
     return 'OTHER';
   }
 
-  Future<void> _pushHealthSchedules(
-    String? webFarmId, {
-    required String? Function(String? localUserId) pushUserIdForPayload,
-  }) async {
+  Future<void> _pushHealthSchedules(String? webFarmId) async {
+    _requireNestApi();
+    final entries = <Map<String, dynamic>>[];
     final pendingVax = await (db.select(
       db.vaccinationSchedules,
     )..where((t) => t.synced.equals(false))).get();
-    for (var v in pendingVax) {
-      try {
-        final id = safeIdString(v.id);
-        final existing = await _supabase
-            .from('vaccination_schedules')
-            .select('id')
-            .eq('id', id)
-            .maybeSingle();
-        final payload = {
-          'id': id,
-          'farmId': _remoteFarmIdForPush(v.farmId, webFarmId),
-          'batchId': safeIdString(v.batchId),
-          'vaccineName': v.vaccineName,
-          'scheduledDate': v.scheduledDate.toIso8601String(),
-          'status': v.status,
-          'notes': v.notes,
-          'quantity': v.quantity,
-          'usageType': v.usageType,
-          'unit': v.unit,
-        };
-        assertSyncPayloadUsesStringIds(payload);
-        if (existing != null) {
-          await _supabase
-              .from('vaccination_schedules')
-              .update(payload)
-              .eq('id', id);
-        } else {
-          await _supabase.from('vaccination_schedules').insert(payload);
-        }
-        await (db.update(db.vaccinationSchedules)
-              ..where((t) => t.id.equals(v.id)))
-            .write(const VaccinationSchedulesCompanion(synced: Value(true)));
-      } catch (e) {
-        debugPrint('Vaccination push error: $e');
-      }
+    for (final v in pendingVax) {
+      entries.add({
+        'type': 'VACCINATION',
+        'batchId': safeIdString(v.batchId),
+        'name': v.vaccineName,
+        'scheduledDate': v.scheduledDate.toIso8601String(),
+        'status': v.status,
+        'notes': v.notes,
+        'quantity': v.quantity,
+        'usageType': v.usageType,
+        'unit': v.unit,
+      });
     }
 
     final pendingMed = await (db.select(
       db.medicationSchedules,
     )..where((t) => t.synced.equals(false))).get();
-    for (var m in pendingMed) {
+    for (final m in pendingMed) {
+      entries.add({
+        'type': 'MEDICATION',
+        'batchId': safeIdString(m.batchId),
+        'name': m.medicationName,
+        'scheduledDate': m.scheduledDate.toIso8601String(),
+        'status': m.status,
+        'notes': m.notes,
+        'quantity': m.quantity,
+        'usageType': m.usageType,
+        'unit': m.unit,
+      });
+    }
+
+    if (entries.isNotEmpty) {
       try {
-        final id = safeIdString(m.id);
-        final existing = await _supabase
-            .from('medication_schedules')
-            .select('id')
-            .eq('id', id)
-            .maybeSingle();
+        final remoteFarmId = _remoteFarmIdForPush(
+          pendingVax.isNotEmpty
+              ? pendingVax.first.farmId
+              : pendingMed.first.farmId,
+          webFarmId,
+        );
         final payload = {
-          'id': id,
-          'farmId': _remoteFarmIdForPush(m.farmId, webFarmId),
-          'batchId': safeIdString(m.batchId),
-          'medicationName': m.medicationName,
-          'scheduledDate': m.scheduledDate.toIso8601String(),
-          'status': m.status,
-          'notes': m.notes,
-          'quantity': m.quantity,
-          'usageType': m.usageType,
-          'unit': m.unit,
+          'farm_id': remoteFarmId,
+          'entries': entries,
         };
         assertSyncPayloadUsesStringIds(payload);
-        if (existing != null) {
-          await _supabase
-              .from('medication_schedules')
-              .update(payload)
-              .eq('id', id);
-        } else {
-          await _supabase.from('medication_schedules').insert(payload);
+        await _hatchlogApi.createHealthSchedules(payload);
+        for (final v in pendingVax) {
+          await (db.update(db.vaccinationSchedules)
+                ..where((t) => t.id.equals(v.id)))
+              .write(const VaccinationSchedulesCompanion(synced: Value(true)));
         }
-        await (db.update(db.medicationSchedules)
-              ..where((t) => t.id.equals(m.id)))
-            .write(const MedicationSchedulesCompanion(synced: Value(true)));
+        for (final m in pendingMed) {
+          await (db.update(db.medicationSchedules)
+                ..where((t) => t.id.equals(m.id)))
+              .write(const MedicationSchedulesCompanion(synced: Value(true)));
+        }
       } catch (e) {
-        debugPrint('Medication push error: $e');
+        debugPrint('Health schedules push error: $e');
       }
     }
 
     final pendingWeight = await (db.select(
       db.weightRecords,
     )..where((t) => t.synced.equals(false))).get();
-    for (var w in pendingWeight) {
+    for (final w in pendingWeight) {
       try {
-        final id = safeIdString(w.id);
-        final existing = await _supabase
-            .from('weight_records')
-            .select('id')
-            .eq('id', id)
-            .maybeSingle();
+        final remoteFarmId = _remoteFarmIdForPush(w.farmId, webFarmId);
+        final batchId = safeIdString(w.batchId);
         final payload = {
-          'id': id,
-          'farmId': _remoteFarmIdForPush(w.farmId, webFarmId),
-          'batchId': safeIdString(w.batchId),
+          'farm_id': remoteFarmId,
           'averageWeight': w.averageWeight,
           'logDate': w.logDate.toIso8601String(),
-          'userId': pushUserIdForPayload(w.userId),
         };
         assertSyncPayloadUsesStringIds(payload);
-        if (existing != null) {
-          await _supabase.from('weight_records').update(payload).eq('id', id);
-        } else {
-          await _supabase.from('weight_records').insert(payload);
-        }
+        await _hatchlogApi.createWeightRecord(batchId, payload);
         await (db.update(db.weightRecords)..where((t) => t.id.equals(w.id)))
             .write(const WeightRecordsCompanion(synced: Value(true)));
       } catch (e) {
@@ -2262,30 +1775,26 @@ class SyncEngine extends ChangeNotifier {
     )..where((t) => t.synced.equals(false))).get();
     for (final settings in pending) {
       try {
+        _requireNestApi();
         final farmId = _remoteFarmIdForPush(settings.farmId, webFarmId);
         final farm = await (db.select(
           db.farms,
         )..where((t) => t.id.equals(settings.farmId))).getSingleOrNull();
         if (farm != null) {
-          await _supabase.from('farms').update({
+          await _hatchlogApi.updateFarm(farmId, {
             'name': farm.name,
             'location': farm.location,
             'capacity': farm.capacity,
-            'updatedAt': DateTime.now().toUtc().toIso8601String(),
-          }).eq('id', farmId);
+          });
         }
-        final payload = {
-          'id': safeIdString(settings.id),
-          'farmId': farmId,
+        await _hatchlogApi.updateFarmSettings(farmId, {
           'currency': settings.currency,
           'eggsPerCrate': settings.eggsPerCrate,
           'eggRecordReminderTime': settings.eggRecordReminderTime,
           'feedRecordReminderTime': settings.feedRecordReminderTime,
           if (settings.growthTargetStandard != null)
-            'growth_target_standard': settings.growthTargetStandard,
-          'updatedAt': DateTime.now().toUtc().toIso8601String(),
-        };
-        await _supabase.from('farm_settings').upsert(payload);
+            'growthTargetStandard': settings.growthTargetStandard,
+        });
         await (db.update(db.farmSettings)
               ..where((t) => t.id.equals(settings.id)))
             .write(const FarmSettingsCompanion(synced: Value(true)));
@@ -2296,75 +1805,108 @@ class SyncEngine extends ChangeNotifier {
   }
 
   Future<void> _pullHealthSchedules(String farmIdFilter) async {
-    final remoteVax = await _supabase
-        .from('vaccination_schedules')
-        .select()
-        .eq('farmId', farmIdFilter);
-    for (var v in remoteVax) {
+    _requireNestApi();
+    final schedules = await _hatchlogApi.listHealthSchedules(farmIdFilter);
+    final remoteVax = (schedules['vaccinations'] as List?) ?? const [];
+    for (final raw in remoteVax) {
+      final v = Map<String, dynamic>.from(raw as Map);
       await db
           .into(db.vaccinationSchedules)
           .insertOnConflictUpdate(
             VaccinationSchedulesCompanion.insert(
               id: safeIdString(v['id']),
               farmId: farmIdFilter,
-              batchId: safeIdString(v['batchId']),
-              vaccineName: v['vaccineName'] as String,
+              batchId: safeIdString(v['batchId'] ?? v['batch_id']),
+              vaccineName:
+                  (v['vaccineName'] ?? v['vaccine_name'] ?? '') as String,
               scheduledDate:
-                  _safeDateTime(v['scheduledDate']) ?? DateTime.now().toUtc(),
+                  _safeDateTime(v['scheduledDate'] ?? v['scheduled_date']) ??
+                  DateTime.now().toUtc(),
               status: Value(v['status'] as String? ?? 'PENDING'),
               notes: Value(v['notes'] as String?),
               quantity: Value(_safeDouble(v['quantity']) ?? 1),
-              usageType: Value(v['usageType'] as String?),
+              usageType: Value(
+                (v['usageType'] ?? v['usage_type']) as String?,
+              ),
               unit: Value(v['unit'] as String?),
               synced: const Value(true),
             ),
           );
     }
 
-    final remoteMed = await _supabase
-        .from('medication_schedules')
-        .select()
-        .eq('farmId', farmIdFilter);
-    for (var m in remoteMed) {
+    final remoteMed = (schedules['medications'] as List?) ?? const [];
+    for (final raw in remoteMed) {
+      final m = Map<String, dynamic>.from(raw as Map);
       await db
           .into(db.medicationSchedules)
           .insertOnConflictUpdate(
             MedicationSchedulesCompanion.insert(
               id: safeIdString(m['id']),
               farmId: farmIdFilter,
-              batchId: safeIdString(m['batchId']),
-              medicationName: m['medicationName'] as String,
+              batchId: safeIdString(m['batchId'] ?? m['batch_id']),
+              medicationName:
+                  (m['medicationName'] ?? m['medication_name'] ?? '')
+                      as String,
               scheduledDate:
-                  _safeDateTime(m['scheduledDate']) ?? DateTime.now().toUtc(),
+                  _safeDateTime(m['scheduledDate'] ?? m['scheduled_date']) ??
+                  DateTime.now().toUtc(),
               status: Value(m['status'] as String? ?? 'PENDING'),
               notes: Value(m['notes'] as String?),
               quantity: Value(_safeDouble(m['quantity']) ?? 1),
-              usageType: Value(m['usageType'] as String?),
+              usageType: Value(
+                (m['usageType'] ?? m['usage_type']) as String?,
+              ),
               unit: Value(m['unit'] as String?),
               synced: const Value(true),
             ),
           );
     }
 
-    final remoteWeight = await _supabase
-        .from('weight_records')
-        .select()
-        .eq('farmId', farmIdFilter);
-    for (var w in remoteWeight) {
-      await db
-          .into(db.weightRecords)
-          .insertOnConflictUpdate(
-            WeightRecordsCompanion.insert(
-              id: safeIdString(w['id']),
-              farmId: farmIdFilter,
-              batchId: safeIdString(w['batchId']),
-              averageWeight: _safeDouble(w['averageWeight']) ?? 0.0,
-              logDate: _safeDateTime(w['logDate']) ?? DateTime.now().toUtc(),
-              userId: Value(w['userId'] as String?),
-              synced: const Value(true),
-            ),
-          );
+    // Weight records live under livestock details on Nest.
+    final remoteBatches = await _hatchlogApi.listLivestock(farmIdFilter);
+    var weightCount = 0;
+    for (final raw in remoteBatches) {
+      final batch = Map<String, dynamic>.from(raw as Map);
+      final batchId = safeIdString(batch['id']);
+      try {
+        final details =
+            await _hatchlogApi.getLivestockDetails(batchId, farmIdFilter);
+        final weights = (details['weightRecords'] as List?) ??
+            (details['weight_records'] as List?) ??
+            const [];
+        for (final wRaw in weights) {
+          final w = Map<String, dynamic>.from(wRaw as Map);
+          await db
+              .into(db.weightRecords)
+              .insertOnConflictUpdate(
+                WeightRecordsCompanion.insert(
+                  id: safeIdString(w['id']),
+                  farmId: farmIdFilter,
+                  batchId: batchId,
+                  averageWeight:
+                      _safeDouble(
+                        w['averageWeight'] ?? w['average_weight'],
+                      ) ??
+                      0.0,
+                  logDate:
+                      _safeDateTime(w['logDate'] ?? w['log_date']) ??
+                      DateTime.now().toUtc(),
+                  userId: Value(
+                    (w['userId'] ?? w['user_id']) as String?,
+                  ),
+                  synced: const Value(true),
+                ),
+              );
+          weightCount++;
+        }
+      } catch (e) {
+        debugPrint('Weight pull for batch $batchId failed: $e');
+      }
     }
+    debugPrint(
+      'Pull: synced ${remoteVax.length} vaccinations, '
+      '${remoteMed.length} medications, $weightCount weight records',
+    );
   }
 
   @override

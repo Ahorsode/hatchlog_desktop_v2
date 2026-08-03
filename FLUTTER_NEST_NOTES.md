@@ -1,9 +1,21 @@
-# Flutter Nest notes (Phase 3)
+# Flutter Nest notes (desktop) — Nest required
+
+## Transport
+- **Farm / commerce data:** Nest REST + `/api/v1/sync/push` only. `HATCHLOG_API_URL` is **required** in `.env` at app start.
+- Sync online gate uses Nest `canReach()` (not Supabase HEAD).
+- **Auth / identity leftovers:** Supabase Auth (JWT), license RPCs, team provision edge, membership/permissions.
 
 ## Online
-- `HatchlogApiClient` uses Nest domain REST (`/api/v1/livestock`, `/houses`, `/eggs`, …) with Bearer Supabase JWT.
-- Sync engine prefers Nest for houses/livestock online hydration when `HATCHLOG_API_URL` is set and reachable.
+- Push/pull Nest-only for: houses, livestock, inventory, sales, expenses, customers, suppliers, formulations, eggs, feeding, mortality, health schedules, ledger txs, farm settings, egg categories
+- Pending deletions sync via Nest soft-delete endpoints (not Supabase `.delete()`)
+- Trash list/restore and audit logs via Nest `/api/v1/trash` and `/api/v1/audit`
+- No Supabase dual-write/fallback for Nest-owned domains
 
 ## Offline
-- Mortality / feeding / eggs continue via `/api/v1/sync/push`.
-- Local SQLite/Drift offline path is unchanged.
+- Egg / feed / mortality → `POST /api/v1/sync/push`
+- Do **not** expand offline sync beyond those three entities
+
+## Smoke checklist
+- Missing `HATCHLOG_API_URL` → app start throws
+- Nest up: farm sync does not insert into Supabase commerce/ops tables
+- Auth / license / team provision still use Supabase

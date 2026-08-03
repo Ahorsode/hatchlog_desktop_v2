@@ -86,7 +86,16 @@ void main() async {
     debugPrint('No .env found, proceeding with defaults or placeholders. $e');
   }
 
-  // Supabase Init with Secure Storage
+  final nestApiUrl = (dotenv.env['HATCHLOG_API_URL'] ?? '').trim();
+  if (nestApiUrl.isEmpty) {
+    throw StateError(
+      'HATCHLOG_API_URL is required for farm data sync. '
+      'Set it in .env (e.g. HATCHLOG_API_URL=http://localhost:3001).',
+    );
+  }
+  debugPrint('HatchLog API required at: $nestApiUrl');
+
+  // Supabase Init with Secure Storage (Auth / license / team provision only)
   await Supabase.initialize(
     url: dotenv.env['SUPABASE_URL'] ?? 'https://PLACEHOLDER.supabase.co',
     anonKey: dotenv.env['SUPABASE_ANON_KEY'] ?? 'PLACEHOLDER',

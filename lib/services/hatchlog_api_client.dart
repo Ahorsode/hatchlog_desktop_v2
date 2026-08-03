@@ -178,6 +178,16 @@ class HatchlogApiClient {
         body: body,
       );
 
+  Future<Map<String, dynamic>> updateFeeding(
+    String id,
+    Map<String, dynamic> body,
+  ) =>
+      _requestJsonUnwrap(
+        method: 'PATCH',
+        path: '/api/v1/feeding/$id',
+        body: body,
+      );
+
   Future<Map<String, dynamic>> deleteFeeding(String id) =>
       _requestJsonUnwrap(method: 'DELETE', path: '/api/v1/feeding/$id');
 
@@ -192,6 +202,311 @@ class HatchlogApiClient {
         method: 'POST',
         path: '/api/v1/mortality',
         body: body,
+      );
+
+  Future<Map<String, dynamic>> updateMortality(
+    String id,
+    Map<String, dynamic> body,
+  ) =>
+      _requestJsonUnwrap(
+        method: 'PATCH',
+        path: '/api/v1/mortality/$id',
+        body: body,
+      );
+
+  Future<Map<String, dynamic>> deleteMortality(String id) =>
+      _requestJsonUnwrap(method: 'DELETE', path: '/api/v1/mortality/$id');
+
+  // --- Commerce / finance / health (Nest domain REST) ---
+
+  Future<List<dynamic>> listInventory(String farmId) => _requestList(
+        method: 'GET',
+        path: '/api/v1/inventory',
+        query: {'farm_id': farmId},
+      );
+
+  Future<Map<String, dynamic>> createInventory(Map<String, dynamic> body) =>
+      _requestJsonUnwrap(
+        method: 'POST',
+        path: '/api/v1/inventory',
+        body: body,
+      );
+
+  Future<Map<String, dynamic>> updateInventory(
+    String id,
+    Map<String, dynamic> body,
+  ) =>
+      _requestJsonUnwrap(
+        method: 'PATCH',
+        path: '/api/v1/inventory/$id',
+        body: body,
+      );
+
+  Future<Map<String, dynamic>> deleteInventory(
+    String id,
+    String farmId, {
+    String? reason,
+  }) =>
+      _requestJsonUnwrap(
+        method: 'DELETE',
+        path: '/api/v1/inventory/$id',
+        query: {'farm_id': farmId},
+        body: {if (reason != null && reason.isNotEmpty) 'reason': reason},
+      );
+
+  Future<List<dynamic>> listCustomers(String farmId) => _requestList(
+        method: 'GET',
+        path: '/api/v1/customers',
+        query: {'farm_id': farmId},
+      );
+
+  Future<Map<String, dynamic>> createCustomer(Map<String, dynamic> body) =>
+      _requestJsonUnwrap(
+        method: 'POST',
+        path: '/api/v1/customers',
+        body: body,
+      );
+
+  Future<Map<String, dynamic>> updateCustomer(
+    String id,
+    Map<String, dynamic> body,
+  ) =>
+      _requestJsonUnwrap(
+        method: 'PATCH',
+        path: '/api/v1/customers/$id',
+        body: body,
+      );
+
+  Future<Map<String, dynamic>> deleteCustomer(String id, String farmId) =>
+      _requestJsonUnwrap(
+        method: 'DELETE',
+        path: '/api/v1/customers/$id',
+        query: {'farm_id': farmId},
+      );
+
+  Future<List<dynamic>> listSuppliers(String farmId) => _requestList(
+        method: 'GET',
+        path: '/api/v1/suppliers',
+        query: {'farm_id': farmId},
+      );
+
+  Future<Map<String, dynamic>> createSupplier(Map<String, dynamic> body) =>
+      _requestJsonUnwrap(
+        method: 'POST',
+        path: '/api/v1/suppliers',
+        body: body,
+      );
+
+  Future<Map<String, dynamic>> updateSupplier(
+    String id,
+    Map<String, dynamic> body,
+  ) =>
+      _requestJsonUnwrap(
+        method: 'PATCH',
+        path: '/api/v1/suppliers/$id',
+        body: body,
+      );
+
+  Future<List<dynamic>> listSales(String farmId) => _requestList(
+        method: 'GET',
+        path: '/api/v1/sales',
+        query: {'farm_id': farmId},
+      );
+
+  Future<Map<String, dynamic>> createSale(Map<String, dynamic> body) =>
+      _requestJsonUnwrap(method: 'POST', path: '/api/v1/sales', body: body);
+
+  Future<Map<String, dynamic>> deleteSale(
+    String id,
+    String farmId, {
+    String? reason,
+  }) =>
+      _requestJsonUnwrap(
+        method: 'DELETE',
+        path: '/api/v1/sales/$id',
+        query: {'farm_id': farmId},
+        body: {if (reason != null && reason.isNotEmpty) 'reason': reason},
+      );
+
+  Future<List<dynamic>> listExpenses(String farmId) => _requestList(
+        method: 'GET',
+        path: '/api/v1/expenses',
+        query: {'farm_id': farmId},
+      );
+
+  Future<Map<String, dynamic>> createExpense(Map<String, dynamic> body) =>
+      _requestJsonUnwrap(
+        method: 'POST',
+        path: '/api/v1/expenses',
+        body: body,
+      );
+
+  Future<Map<String, dynamic>> deleteExpense(
+    String id,
+    String farmId, {
+    String reason = 'Deleted from desktop sync',
+  }) =>
+      _requestJsonUnwrap(
+        method: 'DELETE',
+        path: '/api/v1/expenses/$id',
+        body: {'farm_id': farmId, 'reason': reason},
+      );
+
+  Future<List<dynamic>> listIsolationRooms(String farmId) => _requestList(
+        method: 'GET',
+        path: '/api/v1/isolation-rooms',
+        query: {'farm_id': farmId},
+      );
+
+  Future<Map<String, dynamic>> createIsolationRoom(
+    Map<String, dynamic> body,
+  ) =>
+      _requestJsonUnwrap(
+        method: 'POST',
+        path: '/api/v1/isolation-rooms',
+        body: body,
+      );
+
+  Future<Map<String, dynamic>> listHealthSchedules(String farmId) =>
+      _requestJsonUnwrap(
+        method: 'GET',
+        path: '/api/v1/health-schedules',
+        query: {'farm_id': farmId},
+      );
+
+  Future<Map<String, dynamic>> createHealthSchedules(
+    Map<String, dynamic> body,
+  ) =>
+      _requestJsonUnwrap(
+        method: 'POST',
+        path: '/api/v1/health-schedules',
+        body: body,
+      );
+
+  Future<List<dynamic>> listHealthInventory(String farmId) => _requestList(
+        method: 'GET',
+        path: '/api/v1/health-inventory',
+        query: {'farm_id': farmId},
+      );
+
+  Future<Map<String, dynamic>> createWeightRecord(
+    String batchId,
+    Map<String, dynamic> body,
+  ) =>
+      _requestJsonUnwrap(
+        method: 'POST',
+        path: '/api/v1/livestock/$batchId/weight',
+        body: body,
+      );
+
+  Future<Map<String, dynamic>> getFarmSettings(String farmId) =>
+      _requestJsonUnwrap(
+        method: 'GET',
+        path: '/api/v1/farms/$farmId/settings',
+      );
+
+  Future<Map<String, dynamic>> updateFarm(
+    String farmId,
+    Map<String, dynamic> body,
+  ) =>
+      _requestJsonUnwrap(
+        method: 'PATCH',
+        path: '/api/v1/farms/$farmId',
+        body: body,
+      );
+
+  Future<Map<String, dynamic>> updateFarmSettings(
+    String farmId,
+    Map<String, dynamic> body,
+  ) =>
+      _requestJsonUnwrap(
+        method: 'PATCH',
+        path: '/api/v1/farms/$farmId/settings',
+        body: body,
+      );
+
+  Future<List<dynamic>> listLedger(String farmId) => _requestList(
+        method: 'GET',
+        path: '/api/v1/ledger',
+        query: {'farm_id': farmId},
+      );
+
+  Future<Map<String, dynamic>> createLedgerTransaction(
+    Map<String, dynamic> body,
+  ) =>
+      _requestJsonUnwrap(method: 'POST', path: '/api/v1/ledger', body: body);
+
+  Future<List<dynamic>> listEggCategories(String farmId) => _requestList(
+        method: 'GET',
+        path: '/api/v1/egg-categories',
+        query: {'farm_id': farmId},
+      );
+
+  Future<Map<String, dynamic>> createEggCategory(Map<String, dynamic> body) =>
+      _requestJsonUnwrap(
+        method: 'POST',
+        path: '/api/v1/egg-categories',
+        body: body,
+      );
+
+  Future<Map<String, dynamic>> listTrash(String farmId) => _requestJsonUnwrap(
+        method: 'GET',
+        path: '/api/v1/trash',
+        query: {'farm_id': farmId},
+      );
+
+  Future<Map<String, dynamic>> restoreTrashItem({
+    required String table,
+    required String id,
+    required String farmId,
+  }) =>
+      _requestJsonUnwrap(
+        method: 'POST',
+        path: '/api/v1/trash/$table/$id/restore',
+        query: {'farm_id': farmId},
+      );
+
+  Future<List<dynamic>> listAuditInsertLogs(String farmId) => _requestList(
+        method: 'GET',
+        path: '/api/v1/audit/insert-logs',
+        query: {'farm_id': farmId},
+      );
+
+  Future<List<dynamic>> listAuditDeleteLogs(String farmId) => _requestList(
+        method: 'GET',
+        path: '/api/v1/audit/delete-logs',
+        query: {'farm_id': farmId},
+      );
+
+  Future<List<dynamic>> listAuditEditLogs(String farmId) => _requestList(
+        method: 'GET',
+        path: '/api/v1/audit/edit-logs',
+        query: {'farm_id': farmId},
+      );
+
+  Future<List<dynamic>> listFeedFormulations(String farmId) => _requestList(
+        method: 'GET',
+        path: '/api/v1/feeding/feed-formulations',
+        query: {'farm_id': farmId},
+      );
+
+  Future<Map<String, dynamic>> createFeedFormulation(
+    Map<String, dynamic> body,
+  ) =>
+      _requestJsonUnwrap(
+        method: 'POST',
+        path: '/api/v1/feeding/feed-formulations',
+        body: body,
+      );
+
+  Future<Map<String, dynamic>> deleteFeedFormulation(
+    String id,
+    String farmId,
+  ) =>
+      _requestJsonUnwrap(
+        method: 'DELETE',
+        path: '/api/v1/feeding/feed-formulations/$id',
+        query: {'farm_id': farmId},
       );
 
   Future<bool> pushMutation({

@@ -1,11 +1,13 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
-import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:intl/intl.dart';
 import 'package:provider/provider.dart';
 import 'package:drift/drift.dart' as drift hide Column;
 import '../utils/farm_utils.dart';
 import '../data/sync_engine.dart';
 import '../data/local_db.dart';
+import '../services/hatchlog_api_client.dart';
 
 class AuditLogScreen extends StatefulWidget {
   const AuditLogScreen({super.key});
@@ -16,7 +18,7 @@ class AuditLogScreen extends StatefulWidget {
 
 class _AuditLogScreenState extends State<AuditLogScreen> with SingleTickerProviderStateMixin {
   late TabController _tabController;
-  final _supabase = Supabase.instance.client;
+  final _api = HatchlogApiClient();
   final TextEditingController _searchController = TextEditingController();
   
   bool _isLoading = true;
@@ -78,32 +80,19 @@ class _AuditLogScreenState extends State<AuditLogScreen> with SingleTickerProvid
       final localUsers = await db.select(db.users).get();
       final userMap = {for (var u in localUsers) u.id: u};
 
-
       List<dynamic> auditData = [];
       try {
-        // 1. Fetch Edit Logs (Safe select without users relationship join)
-        auditData = await _supabase
-            .from('audit_logs')
-            .select('*')
-            .eq('farm_id', farmId)
-            .order('created_at', ascending: false)
-            .limit(100);
+        auditData = await _api.listAuditEditLogs(farmId);
       } catch (e) {
-        debugPrint('Error fetching audit_logs: $e');
+        debugPrint('Error fetching Nest audit edit-logs: $e');
         _fetchError ??= 'Audit Logs: $e\n';
       }
 
       List<dynamic> deleteData = [];
       try {
-        // 2. Fetch Delete Logs (Safe select without users relationship join)
-        deleteData = await _supabase
-            .from('delete_logs')
-            .select('*')
-            .eq('farm_id', farmId)
-            .order('deleted_at', ascending: false)
-            .limit(100);
+        deleteData = await _api.listAuditDeleteLogs(farmId);
       } catch (e) {
-        debugPrint('Error fetching delete_logs: $e');
+        debugPrint('Error fetching Nest audit delete-logs: $e');
         if (_fetchError == null) {
           _fetchError = 'Delete Logs: $e\n';
         } else {
@@ -111,44 +100,51 @@ class _AuditLogScreenState extends State<AuditLogScreen> with SingleTickerProvid
         }
       }
 
-      // Map audit logs with local user details
+      // Map audit logs with Nest user include + local fallback
       final List<Map<String, dynamic>> combined = [];
-      for (var row in auditData) {
-        final userId = row['user_id'] as String?;
-        Map<String, dynamic>? localUserData;
-        if (userId != null && userMap.containsKey(userId)) {
+      for (final raw in auditData) {
+        final row = Map<String, dynamic>.from(raw as Map);
+        final normalized = _normalizeAuditEditRow(row);
+        final userId = normalized['user_id'] as String?;
+        Map<String, dynamic>? userData = _userFromNest(row['user']);
+        if (userData == null &&
+            userId != null &&
+            userMap.containsKey(userId)) {
           final u = userMap[userId]!;
-          localUserData = {
+          userData = {
             'firstname': u.firstname,
             'surname': u.surname,
             'email': u.email,
           };
         }
         combined.add({
-          ...row,
+          ...normalized,
           'type': 'UPDATE',
-          'display_date': row['created_at'],
-          'display_table': row['table_name'],
-          'users': localUserData,
+          'display_date': normalized['created_at'],
+          'display_table': normalized['table_name'],
+          'users': userData,
         });
       }
 
-      // Map delete logs with local user details
       final List<Map<String, dynamic>> mappedDeleteData = [];
-      for (var row in deleteData) {
-        final userId = row['user_id'] as String?;
-        Map<String, dynamic>? localUserData;
-        if (userId != null && userMap.containsKey(userId)) {
+      for (final raw in deleteData) {
+        final row = Map<String, dynamic>.from(raw as Map);
+        final normalized = _normalizeAuditDeleteRow(row);
+        final userId = normalized['user_id'] as String?;
+        Map<String, dynamic>? userData = _userFromNest(row['user']);
+        if (userData == null &&
+            userId != null &&
+            userMap.containsKey(userId)) {
           final u = userMap[userId]!;
-          localUserData = {
+          userData = {
             'firstname': u.firstname,
             'surname': u.surname,
             'email': u.email,
           };
         }
         mappedDeleteData.add({
-          ...row,
-          'users': localUserData,
+          ...normalized,
+          'users': userData,
         });
       }
 
@@ -160,16 +156,118 @@ class _AuditLogScreenState extends State<AuditLogScreen> with SingleTickerProvid
       await _fetchFinancialLogs();
       await _fetchStockLogs();
     } catch (e) {
-      debugPrint('Error fetching Supabase logs: $e');
+      debugPrint('Error fetching Nest audit logs: $e');
       setState(() {
         _fetchError = e.toString();
       });
-      // Fallback: Still fetch local financial and stock logs even if Supabase triggers fail
+      // Fallback: Still fetch local financial and stock logs even if Nest fails
       await _fetchFinancialLogs();
       await _fetchStockLogs();
     } finally {
       setState(() => _isLoading = false);
     }
+  }
+
+  Map<String, dynamic>? _userFromNest(dynamic user) {
+    if (user is! Map) return null;
+    final map = Map<String, dynamic>.from(user);
+    return {
+      'firstname': map['firstname'],
+      'surname': map['surname'],
+      'email': map['email'],
+      'role': map['role'],
+    };
+  }
+
+  Map<String, dynamic> _normalizeAuditEditRow(Map<String, dynamic> row) {
+    return {
+      ...row,
+      'user_id': row['user_id'] ?? row['userId'],
+      'farm_id': row['farm_id'] ?? row['farmId'],
+      'table_name': row['table_name'] ?? row['tableName'],
+      'record_id': row['record_id'] ?? row['recordId'],
+      'attribute_name': row['attribute_name'] ?? row['attributeName'],
+      'old_value': row['old_value'] ?? row['oldValue'],
+      'new_value': row['new_value'] ?? row['newValue'],
+      'action_type': row['action_type'] ?? row['actionType'],
+      'created_at': _isoOrRaw(row['created_at'] ?? row['createdAt']),
+    };
+  }
+
+  Map<String, dynamic> _normalizeAuditDeleteRow(Map<String, dynamic> row) {
+    return {
+      ...row,
+      'user_id': row['user_id'] ?? row['userId'],
+      'farm_id': row['farm_id'] ?? row['farmId'],
+      'table_name': row['table_name'] ?? row['tableName'],
+      'deleted_data_csv':
+          row['deleted_data_csv'] ?? row['deletedDataCsv'] ?? '',
+      'deleted_at': _isoOrRaw(row['deleted_at'] ?? row['deletedAt']),
+      'reason': row['reason'],
+    };
+  }
+
+  String _isoOrRaw(dynamic value) {
+    if (value == null) return DateTime.now().toUtc().toIso8601String();
+    if (value is DateTime) return value.toUtc().toIso8601String();
+    return value.toString();
+  }
+
+  String? _trashTableKeyForDeleteLog(String? tableName) {
+    switch ((tableName ?? '').toLowerCase()) {
+      case 'livestock':
+      case 'batches':
+        return 'batches';
+      case 'egg_production':
+      case 'eggproduction':
+        return 'eggProduction';
+      case 'daily_feeding_logs':
+      case 'feeding_logs':
+      case 'feedinglogs':
+      case 'feedinglog':
+        return 'feedingLogs';
+      case 'mortality':
+      case 'healthmortality':
+        return 'mortality';
+      case 'expenses':
+      case 'expense':
+        return 'expenses';
+      case 'sales':
+      case 'sale':
+        return 'sales';
+      case 'orders':
+      case 'order':
+        return 'orders';
+      case 'inventory':
+        return 'inventory';
+      default:
+        return null;
+    }
+  }
+
+  String? _recordIdFromDeletedData(dynamic deletedData) {
+    if (deletedData == null) return null;
+    final raw = deletedData.toString().trim();
+    if (raw.isEmpty) return null;
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is Map && decoded['id'] != null) {
+        return decoded['id'].toString();
+      }
+    } catch (_) {
+      // Fall through to pipe-CSV format used by older desktop deletes.
+    }
+    final lines = raw.split('\n');
+    if (lines.length < 2) return null;
+    final keys = lines[0].split('|');
+    final values = lines[1].split('|');
+    for (var i = 0; i < keys.length && i < values.length; i++) {
+      if (keys[i].trim().toLowerCase() == 'id') {
+        final id = values[i].trim();
+        return id.isEmpty || id == 'NULL' ? null : id;
+      }
+    }
+    return null;
   }
 
   Future<void> _fetchFinancialLogs() async {
@@ -1149,22 +1247,48 @@ class _AuditLogScreenState extends State<AuditLogScreen> with SingleTickerProvid
   // --- POSTGRES CSV DELETED RECORD DATA PARSER ---
   Widget _buildDeletionCSVDetails(Map<String, dynamic> log) {
     final csv = log['deleted_data_csv'] as String? ?? '';
-    final lines = csv.split('\n');
-    if (lines.length < 2) {
-      return const SizedBox.shrink();
-    }
-    
-    final keys = lines[0].split('|');
-    final values = lines[1].split('|');
     final isDark = Theme.of(context).brightness == Brightness.dark;
-
     final List<MapEntry<String, String>> properties = [];
-    for (int i = 0; i < keys.length; i++) {
-      if (i < values.length) {
-        final k = keys[i].trim();
-        final v = values[i].trim();
-        if (k.isNotEmpty && k != 'synced' && k != 'farm_id' && k != 'farmId' && k != 'user_id' && k != 'userId' && v != 'NULL' && v.isNotEmpty) {
-          properties.add(MapEntry(k, v));
+
+    // Nest delete logs store JSON snapshots; older desktop deletes used pipe CSV.
+    try {
+      final decoded = jsonDecode(csv);
+      if (decoded is Map) {
+        for (final entry in decoded.entries) {
+          final k = entry.key.toString();
+          final v = entry.value?.toString() ?? '';
+          if (k.isNotEmpty &&
+              k != 'synced' &&
+              k != 'farm_id' &&
+              k != 'farmId' &&
+              k != 'user_id' &&
+              k != 'userId' &&
+              v != 'NULL' &&
+              v.isNotEmpty) {
+            properties.add(MapEntry(k, v));
+          }
+        }
+      }
+    } catch (_) {
+      final lines = csv.split('\n');
+      if (lines.length >= 2) {
+        final keys = lines[0].split('|');
+        final values = lines[1].split('|');
+        for (int i = 0; i < keys.length; i++) {
+          if (i < values.length) {
+            final k = keys[i].trim();
+            final v = values[i].trim();
+            if (k.isNotEmpty &&
+                k != 'synced' &&
+                k != 'farm_id' &&
+                k != 'farmId' &&
+                k != 'user_id' &&
+                k != 'userId' &&
+                v != 'NULL' &&
+                v.isNotEmpty) {
+              properties.add(MapEntry(k, v));
+            }
+          }
         }
       }
     }
@@ -1422,9 +1546,24 @@ class _AuditLogScreenState extends State<AuditLogScreen> with SingleTickerProvid
     );
 
     try {
-      await _supabase.rpc('restore_deleted_record', params: {
-        'p_delete_log_id': log['id'],
-      });
+      final farmId = await FarmUtils.getBoundFarmId();
+      if (farmId == null || farmId.isEmpty) {
+        throw StateError('No bound farm found');
+      }
+      final tableKey = _trashTableKeyForDeleteLog(
+        log['table_name']?.toString(),
+      );
+      final recordId = _recordIdFromDeletedData(log['deleted_data_csv']);
+      if (tableKey == null || recordId == null) {
+        throw StateError(
+          'Cannot restore: missing table/record mapping for Nest trash API',
+        );
+      }
+      await _api.restoreTrashItem(
+        table: tableKey,
+        id: recordId,
+        farmId: farmId,
+      );
 
       if (mounted) {
         Navigator.pop(context); // Close loading dialog

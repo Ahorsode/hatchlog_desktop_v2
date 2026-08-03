@@ -54,7 +54,12 @@ class _TrashScreenState extends State<TrashScreen> {
     if (!SettingsProfileContract.canRestoreTrashTab(item.tabKey)) return;
     setState(() => _restoringId = item.id);
     try {
-      await _service.restoreRecord(tabKey: item.tabKey, recordId: item.id);
+      final farmId = await FarmUtils.getBoundFarmId() ?? '';
+      await _service.restoreRecord(
+        farmId: farmId,
+        tabKey: item.tabKey,
+        recordId: item.id,
+      );
       if (mounted) {
         Provider.of<SyncEngine>(context, listen: false).syncNow();
         ScaffoldMessenger.of(context).showSnackBar(
