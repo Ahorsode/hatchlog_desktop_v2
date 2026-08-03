@@ -1251,56 +1251,162 @@ class SyncEngine extends ChangeNotifier {
       );
       if (syncData == null) return;
 
-      // 1. Pull Houses
-      final remoteHouses = (syncData['houses'] as List<dynamic>?) ?? [];
-      for (var h in remoteHouses) {
-        await db
-            .into(db.houses)
-            .insertOnConflictUpdate(
-              HousesCompanion.insert(
-                id: safeIdString(h['id']),
-                farmId: farmIdFilter,
-                userId: Value(h['userId'] as String?),
-                name: h['name'] as String,
-                capacity: _safeInt(h['capacity']) ?? 0,
-                currentTemperature: Value(_safeDouble(h['currentTemperature'])),
-                currentHumidity: Value(_safeDouble(h['currentHumidity'])),
-                isIsolation: Value(h['isIsolation'] as bool? ?? false),
-                synced: const Value(true),
-              ),
-            );
+      // 1. Pull Houses (Nest-first when configured, fallback to Supabase RPC)
+      var housesPulledFromNest = false;
+      if (_hatchlogApi.isConfigured) {
+        try {
+          final nestHouses = await _hatchlogApi.listHouses(farmIdFilter);
+          for (var h in nestHouses) {
+            final house = h as Map<String, dynamic>;
+            await db
+                .into(db.houses)
+                .insertOnConflictUpdate(
+                  HousesCompanion.insert(
+                    id: safeIdString(house['id']),
+                    farmId: farmIdFilter,
+                    userId: Value(
+                      house['user_id'] as String? ?? house['userId'] as String?,
+                    ),
+                    name: (house['name'] ?? '') as String,
+                    capacity: _safeInt(house['capacity']) ?? 0,
+                    currentTemperature: Value(
+                      _safeDouble(
+                        house['current_temperature'] ?? house['currentTemperature'],
+                      ),
+                    ),
+                    currentHumidity: Value(
+                      _safeDouble(
+                        house['current_humidity'] ?? house['currentHumidity'],
+                      ),
+                    ),
+                    isIsolation: Value(
+                      _safeBool(
+                        house['is_isolation'] ?? house['isIsolation'],
+                        fallback: false,
+                      ),
+                    ),
+                    synced: const Value(true),
+                  ),
+                );
+          }
+          debugPrint('Pull: synced ${nestHouses.length} houses from Nest');
+          housesPulledFromNest = true;
+        } catch (e) {
+          debugPrint('WARN: Nest houses pull failed, falling back to Supabase: $e');
+        }
       }
-      debugPrint('Pull: synced ${remoteHouses.length} houses');
-
-      // 2. Pull Batches
-      final remoteBatches = (syncData['batches'] as List<dynamic>?) ?? [];
-      for (var rb in remoteBatches) {
-        await db
-            .into(db.batches)
-            .insertOnConflictUpdate(
-              BatchesCompanion.insert(
-                id: safeIdString(rb['id']),
-                farmId: farmIdFilter,
-                houseId: Value(_safeStr(rb['houseId'] ?? rb['house_id'])),
-                userId: Value(rb['userId'] as String?),
-                batchName: Value(rb['batchName'] as String? ?? ''),
-                type: Value(rb['type'] as String? ?? ''),
-                breedType: Value(rb['breedType'] as String?),
-                status: Value(rb['status'] as String? ?? ''),
-                arrivalDate:
-                    _safeDateTime(rb['arrivalDate']) ?? DateTime.now().toUtc(),
-                currentCount: _safeInt(rb['currentCount']) ?? 0,
-                initialCount: _safeInt(rb['initialCount']) ?? 0,
-                isolationCount: Value(_safeInt(rb['isolationCount']) ?? 0),
-                initialActualCost: Value(
-                  _safeDouble(rb['initial_actual_cost']),
+      if (!housesPulledFromNest) {
+        final remoteHouses = (syncData['houses'] as List<dynamic>?) ?? [];
+        for (var h in remoteHouses) {
+          await db
+              .into(db.houses)
+              .insertOnConflictUpdate(
+                HousesCompanion.insert(
+                  id: safeIdString(h['id']),
+                  farmId: farmIdFilter,
+                  userId: Value(h['userId'] as String?),
+                  name: h['name'] as String,
+                  capacity: _safeInt(h['capacity']) ?? 0,
+                  currentTemperature: Value(_safeDouble(h['currentTemperature'])),
+                  currentHumidity: Value(_safeDouble(h['currentHumidity'])),
+                  isIsolation: Value(h['isIsolation'] as bool? ?? false),
+                  synced: const Value(true),
                 ),
-                growthTarget: Value(rb['growth_target']?.toString()),
-                synced: const Value(true),
-              ),
-            );
+              );
+        }
+        debugPrint('Pull: synced ${remoteHouses.length} houses');
       }
-      debugPrint('Pull: synced ${remoteBatches.length} batches');
+
+      // 2. Pull Batches / Livestock (Nest-first when configured, fallback to Supabase RPC)
+      var batchesPulledFromNest = false;
+      if (_hatchlogApi.isConfigured) {
+        try {
+          final nestLivestock = await _hatchlogApi.listLivestock(farmIdFilter);
+          for (var b in nestLivestock) {
+            final batch = b as Map<String, dynamic>;
+            await db
+                .into(db.batches)
+                .insertOnConflictUpdate(
+                  BatchesCompanion.insert(
+                    id: safeIdString(batch['id']),
+                    farmId: farmIdFilter,
+                    houseId: Value(_safeStr(batch['house_id'] ?? batch['houseId'])),
+                    userId: Value(
+                      batch['user_id'] as String? ?? batch['userId'] as String?,
+                    ),
+                    batchName: Value(
+                      batch['batch_name'] as String? ??
+                          batch['batchName'] as String? ??
+                          batch['name'] as String? ??
+                          '',
+                    ),
+                    type: Value(batch['type'] as String? ?? ''),
+                    breedType: Value(
+                      batch['breed_type'] as String? ??
+                          batch['breedType'] as String?,
+                    ),
+                    status: Value(batch['status'] as String? ?? ''),
+                    arrivalDate:
+                        _safeDateTime(
+                          batch['arrival_date'] ?? batch['arrivalDate'],
+                        ) ??
+                        DateTime.now().toUtc(),
+                    currentCount:
+                        _safeInt(batch['current_count'] ?? batch['currentCount']) ??
+                        0,
+                    initialCount:
+                        _safeInt(batch['initial_count'] ?? batch['initialCount']) ??
+                        0,
+                    isolationCount: Value(
+                      _safeInt(
+                            batch['isolation_count'] ?? batch['isolationCount'],
+                          ) ??
+                          0,
+                    ),
+                    initialActualCost: Value(
+                      _safeDouble(batch['initial_actual_cost']),
+                    ),
+                    growthTarget: Value(batch['growth_target']?.toString()),
+                    synced: const Value(true),
+                  ),
+                );
+          }
+          debugPrint('Pull: synced ${nestLivestock.length} livestock from Nest');
+          batchesPulledFromNest = true;
+        } catch (e) {
+          debugPrint('WARN: Nest livestock pull failed, falling back to Supabase: $e');
+        }
+      }
+      if (!batchesPulledFromNest) {
+        final remoteBatches = (syncData['batches'] as List<dynamic>?) ?? [];
+        for (var rb in remoteBatches) {
+          await db
+              .into(db.batches)
+              .insertOnConflictUpdate(
+                BatchesCompanion.insert(
+                  id: safeIdString(rb['id']),
+                  farmId: farmIdFilter,
+                  houseId: Value(_safeStr(rb['houseId'] ?? rb['house_id'])),
+                  userId: Value(rb['userId'] as String?),
+                  batchName: Value(rb['batchName'] as String? ?? ''),
+                  type: Value(rb['type'] as String? ?? ''),
+                  breedType: Value(rb['breedType'] as String?),
+                  status: Value(rb['status'] as String? ?? ''),
+                  arrivalDate:
+                      _safeDateTime(rb['arrivalDate']) ?? DateTime.now().toUtc(),
+                  currentCount: _safeInt(rb['currentCount']) ?? 0,
+                  initialCount: _safeInt(rb['initialCount']) ?? 0,
+                  isolationCount: Value(_safeInt(rb['isolationCount']) ?? 0),
+                  initialActualCost: Value(
+                    _safeDouble(rb['initial_actual_cost']),
+                  ),
+                  growthTarget: Value(rb['growth_target']?.toString()),
+                  synced: const Value(true),
+                ),
+              );
+        }
+        debugPrint('Pull: synced ${remoteBatches.length} batches');
+      }
 
       // 3. Pull Inventory
       final remoteInventory = (syncData['inventory'] as List<dynamic>?) ?? [];
