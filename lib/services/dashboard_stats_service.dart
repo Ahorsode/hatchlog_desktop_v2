@@ -1,3 +1,5 @@
+import 'package:drift/drift.dart';
+
 import '../data/local_db.dart';
 
 class DashboardAlertInfo {
@@ -43,6 +45,7 @@ class DashboardStatsService {
 
   Future<DashboardStatsSnapshot> loadForFarm(String farmId) async {
     final today = _dayStart(DateTime.now());
+    final tomorrow = today.add(const Duration(days: 1));
     final sevenDaysAgo = today.subtract(const Duration(days: 6));
     final threeDaysAhead = today.add(const Duration(days: 3));
 
@@ -53,56 +56,98 @@ class DashboardStatsService {
     final totalBirds = batches.fold<int>(0, (sum, b) => sum + b.currentCount);
     final initialBirds = batches.fold<int>(0, (sum, b) => sum + b.initialCount);
 
-    final mortalities = await (_db.select(_db.mortalities)
-          ..where((t) => t.farmId.equals(farmId)))
-        .get();
-    final overallDead = mortalities.fold<int>(0, (sum, m) => sum + m.count);
-    final todayDead = mortalities
-        .where((m) => _isSameDay(m.logDate, today))
-        .fold<int>(0, (sum, m) => sum + m.count);
+    final farmVar = Variable.withString(farmId);
+    final todayVar = Variable.withDateTime(today);
+    final tomorrowVar = Variable.withDateTime(tomorrow);
+    final weekVar = Variable.withDateTime(sevenDaysAgo);
+
+    final totals = await Future.wait([
+      _db
+          .customSelect(
+            'SELECT COALESCE(SUM(count), 0) AS total FROM mortality WHERE farm_id = ?',
+            variables: [farmVar],
+            readsFrom: {_db.mortalities},
+          )
+          .getSingle(),
+      _db
+          .customSelect(
+            'SELECT COALESCE(SUM(count), 0) AS total FROM mortality '
+            'WHERE farm_id = ? AND log_date >= ? AND log_date < ?',
+            variables: [farmVar, todayVar, tomorrowVar],
+            readsFrom: {_db.mortalities},
+          )
+          .getSingle(),
+      _db
+          .customSelect(
+            'SELECT COALESCE(SUM(eggs_collected), 0) AS total FROM egg_production '
+            'WHERE farm_id = ? AND log_date >= ? AND log_date < ?',
+            variables: [farmVar, todayVar, tomorrowVar],
+            readsFrom: {_db.eggProductions},
+          )
+          .getSingle(),
+      _db
+          .customSelect(
+            'SELECT COALESCE(stock_level, 0) AS total FROM inventory '
+            'WHERE farm_id = ? AND category = ? LIMIT 1',
+            variables: [farmVar, Variable.withString('EGGS')],
+            readsFrom: {_db.inventory},
+          )
+          .getSingleOrNull(),
+      _db
+          .customSelect(
+            'SELECT COALESCE(SUM(amount_consumed), 0) AS total FROM daily_feeding_logs '
+            'WHERE farm_id = ? AND log_date >= ?',
+            variables: [farmVar, weekVar],
+            readsFrom: {_db.feedingLogs},
+          )
+          .getSingle(),
+      _db
+          .customSelect(
+            'SELECT item_name, stock_level FROM inventory '
+            'WHERE farm_id = ? AND lower(category) = ? AND stock_level < 500',
+            variables: [farmVar, Variable.withString('feed')],
+            readsFrom: {_db.inventory},
+          )
+          .get(),
+      _db
+          .customSelect(
+            'SELECT DISTINCT batch_id FROM egg_production '
+            'WHERE farm_id = ? AND log_date >= ? AND log_date < ?',
+            variables: [farmVar, todayVar, tomorrowVar],
+            readsFrom: {_db.eggProductions},
+          )
+          .get(),
+      (_db.select(_db.vaccinationSchedules)
+            ..where((t) => t.farmId.equals(farmId))
+            ..where((t) => t.status.equals('PENDING')))
+          .get(),
+      (_db.select(_db.medicationSchedules)
+            ..where((t) => t.farmId.equals(farmId))
+            ..where((t) => t.status.equals('PENDING')))
+          .get(),
+    ]);
+
+    final overallDead = (totals[0] as QueryRow).read<int>('total');
+    final todayDead = (totals[1] as QueryRow).read<int>('total');
+    final todayEggs = (totals[2] as QueryRow).read<int>('total');
+    final eggStockRow = totals[3] as QueryRow?;
+    final totalEggStock = eggStockRow == null
+        ? 0
+        : eggStockRow.read<double>('total').round();
+    final weeklyFeedBags = (totals[4] as QueryRow).read<double>('total');
+    final lowFeedRows = totals[5] as List<QueryRow>;
+    final todayEggBatchIds = {
+      for (final row in totals[6] as List<QueryRow>) row.read<String>('batch_id'),
+    };
+    final vaccinations = totals[7] as List<VaccinationSchedule>;
+    final medications = totals[8] as List<MedicationSchedule>;
+
     final mortalityRatePercent = initialBirds == 0
         ? 0.0
         : (overallDead / initialBirds) * 100;
 
-    final eggLogs = await (_db.select(_db.eggProductions)
-          ..where((t) => t.farmId.equals(farmId)))
-        .get();
-    final todayEggs = eggLogs
-        .where((e) => _isSameDay(e.logDate, today))
-        .fold<int>(0, (sum, e) => sum + e.eggsCollected);
-
-    final eggInventory = await (_db.select(_db.inventory)
-          ..where((t) => t.farmId.equals(farmId))
-          ..where((t) => t.category.equals('EGGS')))
-        .get();
-    final totalEggStock = eggInventory.isEmpty
-        ? 0
-        : eggInventory.first.stockLevel.round();
-
-    final feedLogs = await (_db.select(_db.feedingLogs)
-          ..where((t) => t.farmId.equals(farmId)))
-        .get();
-    final weeklyFeedBags = feedLogs
-        .where((log) => !log.logDate.isBefore(sevenDaysAgo))
-        .fold<double>(0, (sum, log) => sum + log.amountConsumed);
-
-    final inventory = await (_db.select(_db.inventory)
-          ..where((t) => t.farmId.equals(farmId)))
-        .get();
-    final lowFeedItems = inventory
-        .where(
-          (item) =>
-              (item.category?.toLowerCase() ?? '') == 'feed' &&
-              item.stockLevel < 500,
-        )
-        .toList();
-
     final alerts = <DashboardAlertInfo>[];
 
-    final vaccinations = await (_db.select(_db.vaccinationSchedules)
-          ..where((t) => t.farmId.equals(farmId))
-          ..where((t) => t.status.equals('PENDING')))
-        .get();
     for (final v in vaccinations.where(
       (v) => !v.scheduledDate.isAfter(threeDaysAhead),
     )) {
@@ -117,10 +162,6 @@ class DashboardStatsService {
       );
     }
 
-    final medications = await (_db.select(_db.medicationSchedules)
-          ..where((t) => t.farmId.equals(farmId))
-          ..where((t) => t.status.equals('PENDING')))
-        .get();
     for (final m in medications) {
       final batch = batches.where((b) => b.id == m.batchId).firstOrNull;
       alerts.add(
@@ -134,10 +175,7 @@ class DashboardStatsService {
     }
 
     for (final batch in batches) {
-      final loggedToday = eggLogs.any(
-        (e) => e.batchId == batch.id && _isSameDay(e.logDate, today),
-      );
-      if (!loggedToday) {
+      if (!todayEggBatchIds.contains(batch.id)) {
         alerts.add(
           DashboardAlertInfo(
             iconName: 'eggs',
@@ -148,12 +186,12 @@ class DashboardStatsService {
       }
     }
 
-    for (final item in lowFeedItems) {
+    for (final item in lowFeedRows) {
       alerts.add(
         DashboardAlertInfo(
           iconName: 'feed',
           message:
-              'Low Stock: ${item.itemName} (${item.stockLevel.toStringAsFixed(0)} bags remaining)',
+              'Low Stock: ${item.read<String>('item_name')} (${item.read<double>('stock_level').toStringAsFixed(0)} bags remaining)',
           severity: 'error',
         ),
       );
@@ -168,7 +206,7 @@ class DashboardStatsService {
       totalEggStock: totalEggStock,
       weeklyFeedBags: weeklyFeedBags,
       alerts: alerts,
-      lowFeedCount: lowFeedItems.length,
+      lowFeedCount: lowFeedRows.length,
     );
   }
 
@@ -185,7 +223,4 @@ class DashboardStatsService {
 
   DateTime _dayStart(DateTime date) =>
       DateTime(date.year, date.month, date.day);
-
-  bool _isSameDay(DateTime a, DateTime b) =>
-      a.year == b.year && a.month == b.month && a.day == b.day;
 }

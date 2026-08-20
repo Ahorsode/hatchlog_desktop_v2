@@ -682,8 +682,10 @@ class _FeedManagementScreenState extends State<FeedManagementScreen> {
                     ),
                   ] else ...[
                     Expanded(
-                      child: ListView(
-                        children: ingredientTotals.entries.map((entry) {
+                      child: ListView.builder(
+                        itemCount: ingredientTotals.length,
+                        itemBuilder: (context, index) {
+                          final entry = ingredientTotals.entries.elementAt(index);
                           return Padding(
                             padding: const EdgeInsets.only(bottom: 20),
                             child: Column(
@@ -718,7 +720,7 @@ class _FeedManagementScreenState extends State<FeedManagementScreen> {
                                     value: (entry.value / 1000).clamp(
                                       0.0,
                                       1.0,
-                                    ), // dynamic scaling
+                                    ),
                                     backgroundColor: progressBg,
                                     valueColor: AlwaysStoppedAnimation<Color>(
                                       isDark
@@ -731,7 +733,7 @@ class _FeedManagementScreenState extends State<FeedManagementScreen> {
                               ],
                             ),
                           );
-                        }).toList(),
+                        },
                       ),
                     ),
                   ],
