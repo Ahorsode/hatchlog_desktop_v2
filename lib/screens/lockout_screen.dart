@@ -7,7 +7,6 @@ import 'package:url_launcher/url_launcher.dart';
 
 import '../data/local_db.dart';
 import '../services/license_service.dart';
-import '../utils/id_utils.dart';
 import 'offline_terminal_login_screen.dart';
 
 /// The reason the lockout screen is shown – controls which variant is rendered.
@@ -104,9 +103,7 @@ class _LockoutScreenState extends State<LockoutScreen>
     try {
       final db = context.read<AppDatabase>();
       final svc = LicenseService(db);
-      final config = await svc.getConfig();
-      final hardwareId = config?.hardwareId ?? await getDeviceHardwareId();
-      await svc.renewFromCloud(hardwareId);
+      await svc.renewFromCloud();
       final status = await svc.checkLicense();
 
       if (!mounted) return;

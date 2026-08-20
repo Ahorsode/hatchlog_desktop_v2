@@ -223,17 +223,13 @@ class _LicenseGateState extends State<LicenseGate> {
         );
 
       case LicenseStatus.valid:
-        final hardwareId = await _hardwareIdForRenewal(svc);
-        if (!mounted) return;
-        if (hardwareId != null) _silentRenew(hardwareId);
+        _silentRenew();
         Navigator.of(context).pushReplacement(
           MaterialPageRoute(builder: (_) => const OfflineTerminalLoginScreen()),
         );
 
       case LicenseStatus.softLocked:
-        final hardwareId = await _hardwareIdForRenewal(svc);
-        if (!mounted) return;
-        if (hardwareId != null) _silentRenew(hardwareId);
+        _silentRenew();
         Navigator.of(context).pushReplacement(
           MaterialPageRoute(
             builder: (_) =>
@@ -259,19 +255,9 @@ class _LicenseGateState extends State<LicenseGate> {
     }
   }
 
-  Future<String?> _hardwareIdForRenewal(LicenseService svc) async {
-    try {
-      final config = await svc.getConfig();
-      final hw = config?.hardwareId;
-      return hw != null && hw.isNotEmpty ? hw : null;
-    } catch (_) {
-      return null;
-    }
-  }
-
-  void _silentRenew(String hardwareId) {
+  void _silentRenew() {
     LicenseService(context.read<AppDatabase>())
-        .renewFromCloud(hardwareId)
+        .renewFromCloud()
         .catchError((e) => debugPrint('[LicenseGate] Silent renew failed: $e'));
   }
 

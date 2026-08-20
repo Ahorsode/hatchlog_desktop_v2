@@ -261,4 +261,38 @@ void main() {
       expect(house.farmId, webFarmId);
     },
   );
+
+  test('owner and later worker share the same farm expiresAt', () async {
+    final periodEndsAt = DateTime.utc(2026, 9, 19, 12);
+
+    await licenseService.applyFarmStatus(
+      {
+        'status': 'trial',
+        'periodEndsAt': periodEndsAt.toIso8601String(),
+      },
+      farmId: 'shared_farm',
+      userId: 'owner',
+      hardwareId: 'hw_owner',
+    );
+
+    final ownerConfig = await licenseService.getConfig();
+    expect(ownerConfig, isNotNull);
+    expect(ownerConfig!.expiresAt.isAtSameMomentAs(periodEndsAt), isTrue);
+    expect(ownerConfig.mode, 'CLOUD_TRIAL');
+
+    await licenseService.applyFarmStatus(
+      {
+        'status': 'trial',
+        'periodEndsAt': periodEndsAt.toIso8601String(),
+      },
+      farmId: 'shared_farm',
+      userId: 'worker',
+      hardwareId: 'hw_worker',
+    );
+
+    final workerConfig = await licenseService.getConfig();
+    expect(workerConfig!.expiresAt.isAtSameMomentAs(ownerConfig.expiresAt), isTrue);
+    expect(workerConfig.userId, 'worker');
+    expect(workerConfig.farmId, 'shared_farm');
+  });
 }

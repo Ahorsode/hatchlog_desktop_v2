@@ -1,11 +1,10 @@
-import 'dart:async';
 import 'package:drift/drift.dart' hide Column;
 import 'package:flutter/foundation.dart';
-import 'package:supabase_flutter/supabase_flutter.dart' hide User;
 
 import '../data/local_db.dart';
 import '../utils/farm_utils.dart';
 import '../utils/id_utils.dart';
+import 'hatchlog_api_client.dart';
 
 /// All possible license states the app can be in at boot time.
 enum LicenseStatus {
@@ -106,177 +105,88 @@ class LicenseService {
   }
 
   // -------------------------------------------------------------------------
-  // CLOUD TRIAL REGISTRATION
+  // FARM-OWNED CLOCK
   // -------------------------------------------------------------------------
 
-  /// Registers this device on Supabase via RPC and persists a 30-day
-  /// CLOUD_TRIAL license locally. Idempotent - safe to call again if the
-  /// device is already registered.
-  ///
-  /// Returns null on success, or an error string.
+  /// Syncs this app to the farm-owned trial/paid clock from Nest.
+  /// Remaining days are the same for owner and later workers.
   Future<String?> initTrialFromCloud({
     required String userId,
     required String farmId,
-    required String hardwareId,
+    String hardwareId = '',
   }) async {
     try {
-      final result = await Supabase.instance.client.rpc(
-        'register_device_trial',
-        params: {
-          'p_user_id': userId,
-          'p_farm_id': farmId,
-          'p_hardware_id': hardwareId,
-          'p_device_name': 'Flutter Desktop',
-          'p_device_type': 'Desktop',
-        },
-      );
-
-      if (result == null) {
-        return 'Trial registration returned no data.';
+      final api = HatchlogApiClient();
+      if (!api.isConfigured) {
+        return 'HatchLog API is not configured.';
       }
-
-      final data = Map<String, dynamic>.from(result as Map);
-
-      if (data['success'] != true) {
-        final errorCode = data['error_code']?.toString() ?? '';
-
-        if (errorCode == 'TRIAL_EXHAUSTED') {
-          final now = DateTime.now();
-          await _upsertConfig(
-            mode: 'HARD_LOCKED',
-            farmId: farmId,
-            userId: userId,
-            hardwareId: hardwareId,
-            installedAt: now,
-            expiresAt: now.subtract(const Duration(days: 36)),
-            lastCloudCheckAt: now,
-          );
-          debugPrint(
-            '[License] TRIAL_EXHAUSTED - farm has no remaining trial.',
-          );
-          return 'TRIAL_EXHAUSTED';
-        }
-
-        return data['error']?.toString() ?? 'Trial registration failed.';
-      }
-
-      final rawExpiry = data['license_expires_at'];
-      final expiresAt = rawExpiry != null
-          ? DateTime.tryParse(rawExpiry.toString()) ??
-                DateTime.now().add(const Duration(days: 30))
-          : DateTime.now().add(const Duration(days: 30));
-
-      await _upsertConfig(
-        mode: 'CLOUD_TRIAL',
+      final data = await api.getSubscriptionStatus(farmId);
+      await applyFarmStatus(
+        data,
         farmId: farmId,
         userId: userId,
         hardwareId: hardwareId,
-        installedAt: DateTime.now(),
-        expiresAt: expiresAt,
-        lastCloudCheckAt: DateTime.now(),
       );
-
-      debugPrint('[License] Trial registered. Expires: $expiresAt');
+      if (data['status']?.toString() == 'locked') {
+        return 'TRIAL_EXHAUSTED';
+      }
       return null;
     } catch (e) {
       debugPrint('[License] initTrialFromCloud error: $e');
-      await _upsertConfig(
-        mode: 'CLOUD_TRIAL',
-        farmId: farmId,
-        userId: userId,
-        hardwareId: hardwareId,
-        installedAt: DateTime.now(),
-        expiresAt: DateTime.now().add(const Duration(days: 30)),
-        lastCloudCheckAt: null,
-      );
-      return null;
+      return 'Could not read farm subscription status.';
     }
   }
 
-  // -------------------------------------------------------------------------
-  // CLOUD SUBSCRIPTION STATUS CHECK
-  // -------------------------------------------------------------------------
-
-  /// Called on every boot (when online) and every 6 hours while the app runs.
-  /// Fetches current subscription status from Supabase and syncs locally.
-  /// Stamps last_cloud_check_at on every successful contact with the server.
-  Future<void> renewFromCloud(String hardwareId) async {
+  /// Called on boot and every 6 hours. Uses the farm clock, not hardware.
+  Future<void> renewFromCloud([String? farmOrHardwareId]) async {
     try {
-      final result = await Supabase.instance.client.rpc(
-        'get_device_subscription_status',
-        params: {'p_hardware_id': hardwareId},
-      );
-
-      if (result == null) return;
-
-      final data = Map<String, dynamic>.from(result as Map);
-      if (data['success'] != true) {
-        debugPrint('[License] Status check failed: ${data['error']}');
-        return;
-      }
-
-      final rawExpiry = data['license_expires_at'];
-      final statusStr = data['license_status']?.toString();
-      final serverExpiry = rawExpiry != null
-          ? DateTime.tryParse(rawExpiry.toString())
-          : null;
-      final trialExhausted = data['trial_exhausted'] == true;
-      final serverMode = statusStr != null
-          ? _serverStatusToLocalMode(statusStr)
-          : null;
-      final isActive = serverMode == 'CLOUD_ACTIVE';
-
-      final now = DateTime.now();
       final config = await _loadConfig();
-      if (config == null) return;
+      final farmId = (config?.farmId != null && config!.farmId!.isNotEmpty)
+          ? config.farmId!
+          : farmOrHardwareId;
+      if (farmId == null || farmId.isEmpty) return;
 
-      if (trialExhausted && !isActive) {
-        await _setMode('HARD_LOCKED');
-        debugPrint(
-          '[License] Server reports trial exhausted - forcing hard lock.',
-        );
-        return;
-      }
-
-      LicenseConfigsCompanion update = LicenseConfigsCompanion(
-        lastUsed: Value(now),
-        lastCloudCheckAt: Value(now),
+      final api = HatchlogApiClient();
+      if (!api.isConfigured) return;
+      final data = await api.getSubscriptionStatus(farmId);
+      await applyFarmStatus(
+        data,
+        farmId: farmId,
+        userId: config?.userId,
+        hardwareId: config?.hardwareId ?? '',
       );
-
-      if (serverExpiry != null && serverExpiry.isAfter(config.expiresAt)) {
-        update = update.copyWith(expiresAt: Value(serverExpiry));
-        debugPrint('[License] Renewed expiry to $serverExpiry from cloud.');
-      }
-
-      if (serverMode != null) {
-        update = update.copyWith(mode: Value(serverMode));
-      }
-
-      await (_db.update(
-        _db.licenseConfigs,
-      )..where((t) => t.id.equals('singleton'))).write(update);
     } catch (e) {
       debugPrint('[License] Cloud renewal skipped (offline?): $e');
     }
   }
 
-  String _serverStatusToLocalMode(String serverStatus) {
-    switch (serverStatus) {
-      case 'ACTIVE':
-      case 'PAID_STANDARD':
-      case 'PAID_PREMIUM':
-        return 'CLOUD_ACTIVE';
-      case 'CLOUD_TRIAL':
-        return 'CLOUD_TRIAL';
-      case 'EXPIRED':
-      case 'TRIAL_EXPIRED':
-        return 'EXPIRED';
-      case 'REVOKED':
-        return 'HARD_LOCKED';
-      default:
-        debugPrint('[License] Unrecognised server status: $serverStatus');
-        return 'CLOUD_TRIAL';
-    }
+  /// Writes Nest farm status into the local singleton. Same [periodEndsAt]
+  /// is stored for every user on the farm.
+  Future<void> applyFarmStatus(
+    Map<String, dynamic> data, {
+    required String farmId,
+    String? userId,
+    String hardwareId = '',
+  }) async {
+    final now = DateTime.now();
+    final status = data['status']?.toString() ?? 'locked';
+    final periodEndsAt =
+        DateTime.tryParse(data['periodEndsAt']?.toString() ?? '') ?? now;
+    final mode = switch (status) {
+      'paid' => 'CLOUD_ACTIVE',
+      'trial' => 'CLOUD_TRIAL',
+      _ => 'HARD_LOCKED',
+    };
+    final config = await _loadConfig();
+    await _upsertConfig(
+      mode: mode,
+      farmId: farmId,
+      userId: userId ?? config?.userId,
+      hardwareId: hardwareId.isNotEmpty ? hardwareId : (config?.hardwareId ?? ''),
+      installedAt: config?.installedAt ?? now,
+      expiresAt: periodEndsAt,
+      lastCloudCheckAt: now,
+    );
   }
 
   // -------------------------------------------------------------------------

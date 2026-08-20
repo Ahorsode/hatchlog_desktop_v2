@@ -84,9 +84,10 @@ class MainScaffoldState extends State<MainScaffold> {
       final db = context.read<AppDatabase>();
       final svc = LicenseService(db);
       final config = await svc.getConfig();
-      if (config?.hardwareId == null) return;
+      final farmId = config?.farmId;
+      if (farmId == null || farmId.isEmpty) return;
 
-      await svc.renewFromCloud(config!.hardwareId!);
+      await svc.renewFromCloud(farmId);
       final status = await svc.checkLicense();
 
       if (!mounted) return;
